@@ -30,9 +30,11 @@ class ServiceManager:
                 service_info["command"] = command
 
             service_info["dir"] = directory
-            threading.Thread(target=self.run_service, args=(service_name, directory, service_info["command"], append_output)).start()
+            # Start the service in a new thread
+            threading.Thread(target=self.run_service, args=(service_name, service_info["command"], directory, append_output)).start()
 
         elif "url" in service_info:
+            # Start a cron-like service (polling a URL)
             url_entry = service_tabs[service_name]["url_entry"]
             interval_entry = service_tabs[service_name]["interval_entry"]
             url = url_entry.get()
@@ -40,23 +42,49 @@ class ServiceManager:
             service_info["url"] = url
             service_info["interval"] = interval
             self.stop_flags[service_name] = threading.Event()  # Create a stop flag
+            # Start the cron service in a new thread
             threading.Thread(target=self.run_cron_service, args=(service_name, url, interval, append_output)).start()
 
         # Save updated configuration
         save_config()
 
-    def run_service(self, service_name, service_dir, command, append_output):
-        append_output(service_name, f"Starting {service_name}...")
-        if service_dir:
-            os.chdir(service_dir)
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True
-        )
-        self.processes[service_name] = process
-        append_output(service_name, "Service started")
-        self.monitor_output(service_name, process, append_output)
+    def run_service(self, service_name, command, service_dir, append_output):
+        """Starts the service without opening a new command window and captures its output."""
+        try:
+            os.chdir(service_dir)  # Change to the service directory
+
+            # Use CREATE_NO_WINDOW to prevent command window from appearing
+            CREATE_NO_WINDOW = 0x08000000
+
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=CREATE_NO_WINDOW,
+                text=True,  # Ensure text mode for proper line-by-line reading
+                bufsize=1   # Line-buffered output
+            )
+
+            self.processes[service_name] = process  # Store the process in a dictionary
+            append_output(service_name, "Service started.")
+
+            # Read stdout and stderr from the process line-by-line
+            def read_output(pipe, service_name):
+                for line in iter(pipe.readline, ''):
+                    if line:
+                        append_output(service_name, line.strip())  # Append each log line to the output
+                pipe.close()
+
+            # Start threads to read stdout and stderr simultaneously
+            threading.Thread(target=read_output, args=(process.stdout, service_name)).start()
+            threading.Thread(target=read_output, args=(process.stderr, service_name)).start()
+
+        except Exception as e:
+            append_output(service_name, f"Error starting service: {e}")
+
 
     def run_cron_service(self, service_name, url, interval, append_output):
+        """Starts a cron-like service that polls a URL at regular intervals."""
         append_output(service_name, f"Starting {service_name}...")
         self.processes[service_name] = True
         append_output(service_name, "Service started")
@@ -74,6 +102,7 @@ class ServiceManager:
             stop_flag.wait(interval)  # Pause for the interval, but allow for interruption
 
     def stop_service(self, service_name, append_output):
+        """Stops the service."""
         if service_name in self.processes and self.processes[service_name]:
             append_output(service_name, f"Stopping {service_name}...")
 
@@ -99,14 +128,17 @@ class ServiceManager:
                 self.stop_service(service_name, lambda name, msg: None)  # Stop service without appending output
 
     def restart_service(self, service_name, service_tabs, append_output, save_config):
+        """Restarts the service by stopping it and starting it again."""
         self.stop_service(service_name, append_output)
         self.start_service(service_name, service_tabs, append_output, save_config)
 
     def clear_log(self, service_name, service_tabs):
+        """Clears the output log for the service."""
         output_area = service_tabs[service_name]["output_area"]
         output_area.delete(1.0, 'end')
 
     def monitor_output(self, service_name, process, append_output):
+        """Monitors the output from the service process."""
         def read_output():
             for output in iter(process.stdout.readline, ''):
                 if output:
