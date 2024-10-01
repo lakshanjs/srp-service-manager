@@ -1,0 +1,53 @@
+{
+    "Main Centrifugo": {
+        "dir": "D:\\wamp\\www\\srplh\\servers\\cfgo\\",
+        "command": [
+            "centrifugo",
+            "-c",
+            "config.json"
+        ]
+    },
+    "CS Centrifugo": {
+        "dir": "D:\\wamp\\www\\srplh\\servers\\cfgo\\",
+        "command": [
+            "centrifugo",
+            "-c",
+            "csconfig.json"
+        ]
+    },
+    "Worker": {
+        "dir": "D:\\wamp\\www\\srplh\\servers\\workers\\",
+        "command": [
+            "php",
+            "worker.php"
+        ]
+    },
+    "Cron Task": {
+        "type": "cron",
+        "url": "https://srplh.test/cron/tasks",
+        "interval": 60
+    },
+    "Memcached": {
+        "dir": "C:\\memcached\\bin\\",
+        "command": [
+            "memcached.exe"
+        ]
+    },
+    "Ngrok": {
+        "dir": "",
+        "command": [
+            "ngrok",
+            "http",
+            "--domain=in-unicorn-smart.ngrok-free.app",
+            "80"
+        ]
+    },
+    "Tika": {
+        "dir": "C:\\Tika",
+        "command": [
+            "java",
+            "-jar",
+            "tika-server-standard-2.8.0.jar"
+        ]
+    }
+}
