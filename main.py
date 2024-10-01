@@ -3,6 +3,7 @@ from tkinter import ttk
 from service import ServiceManager
 from tray_manager import TrayManager
 from ui_manager import UIManager
+from update import check_for_updates  # Import the update check function
 
 if __name__ == "__main__":
     root = tk.Tk()
@@ -30,5 +31,8 @@ if __name__ == "__main__":
 
     # Set up the tray functionality
     tray_manager.setup_tray()
+
+    # Check for updates on startup
+    check_for_updates()  # Call this function to check for updates on startup
 
     root.mainloop()
