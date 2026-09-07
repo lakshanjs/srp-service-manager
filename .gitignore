@@ -31,6 +31,9 @@ lib64/
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# ...but main.spec is hand-edited — it bundles the icon, the sv-ttk theme data and the
+# tray backend — and the documented build step doesn't work without it.
+!main.spec
 
 # Installer logs
 pip-log.txt

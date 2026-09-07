@@ -1,4 +1,6 @@
-
-pystray==0.17.3
-Pillow==9.2.0
-requests==2.28.1
+pystray==0.19.5
+sv-ttk==2.6.1
+Pillow==10.4.0
+requests==2.32.3
+packaging==24.1
+pyinstaller==6.10.0
