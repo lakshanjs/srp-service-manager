@@ -13,7 +13,7 @@ except ImportError:
 
 # Bump this with every build that gets deployed, or a newer release can't be recognised
 # as newer. It's also what the About card shows.
-CURRENT_VERSION = "1.2"
+CURRENT_VERSION = "1.3"
 
 # The repository releases are published to. This fork was copied out of SRP Service
 # Manager and publishes alongside it rather than under a repo of its own. Overridable
