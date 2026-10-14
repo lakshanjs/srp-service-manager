@@ -197,6 +197,17 @@ DEFAULT_SERVICES = {
         "include_in_start_all": True,
         "autostart": False,
     },
+    # Live updates (the till, the kitchen screen): `manage.py run_centrifugo` starts the
+    # Centrifugo program with the secrets from this PC's settings_local.py, so nothing secret
+    # lives here and the entry is the same on every PC. Each developer only needs
+    # centrifugo.exe in ~/.neobe-centrifugo (or on PATH). Port 8100; SRP's is separate.
+    "Neo Centrifugo": {
+        "app": "neo",
+        "dir": "${project_dir}",
+        "command": ["${python}", "manage.py", "run_centrifugo"],
+        "include_in_start_all": True,
+        "autostart": False,
+    },
     # `npm run dev` for the PWA: Vite serves the modules on :5173 while Django still
     # serves the page. Long-running like the Django server, so it's a service with a
     # status dot and a Stop button rather than a one-shot task.

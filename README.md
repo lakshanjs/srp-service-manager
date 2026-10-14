@@ -326,6 +326,13 @@ The gear at the foot of the app rail. Preferences save the moment you change the
   **NeoHotelier App** build page (`npm run build`) for regenerating the committed bundle. Django
   serves the page either way — Vite only serves the modules — so the dev server is what you
   run while working on the front end, and the build page is what you run before committing.
+- **Neo Centrifugo** (live updates for the till and kitchen screen, port 8100) runs
+  `manage.py run_centrifugo`, which starts Centrifugo with the secrets from that PC's own
+  `settings_local.py` (`CENTRIFUGO`: `API_KEY`, `TOKEN_SECRET`). Nothing secret is in this app,
+  so the entry is the same for everyone. Each developer needs `centrifugo.exe` (v6.9.7, from
+  the Centrifugo releases on GitHub) in `~/.neobe-centrifugo` or on PATH; the service's log
+  says what is missing. It is separate from SRP's **Main Centrifugo**. On an existing config,
+  **Restore missing defaults** adds it.
 - The shipped SRP defaults follow the `SRP_Tools` layout the tools actually run from, and
   include **Elasticsearch** (excluded from Start All). Defaults only seed a fresh install —
   an existing `services.json` is never rewritten from them, so use **Restore missing
