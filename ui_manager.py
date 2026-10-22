@@ -4,25 +4,40 @@ import math
 import os
 import re
 import threading
+import time
 import tkinter as tk
+from collections import deque
 from tkinter import ttk, messagebox, colorchooser, filedialog
+import tkinter.font as tkfont
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 import config_manager
 import redis_lists      # tiny Redis/Memurai client for the Lists panel
 import update           # version string + the GitHub release check
+from control_api import LogBuffer  # recent log lines, readable through the control API
 
 # Tk's canvas draws shapes with no antialiasing, which makes a small circle badge look
 # visibly stair-stepped. The rail tiles are therefore drawn with PIL at this multiple and
 # downsampled with LANCZOS, which is what actually smooths the edges.
 TILE_SUPERSAMPLE = 4
 
+# Type. Windows 11's own Segoe UI Variable, in the optical size each role calls for, and
+# Cascadia Mono for what is literally code: logs, command lines, pids. Resolved against the
+# installed families once Tk is up (pick_fonts), falling back to plain Segoe UI / Consolas.
+UI_FONT = "Segoe UI Variable Text"
+UI_STRONG_FONT = "Segoe UI Variable Text Semibold"
+SMALL_FONT = "Segoe UI Variable Small"
+DISPLAY_FONT = "Segoe UI Variable Display Semib"
+MONO_FONT = "Cascadia Mono"
+
 # Dark "console" styling for the log areas (tk.Text isn't themed by ttk).
-LOG_BG = "#1e1e1e"
-LOG_FG = "#cfd3d8"
+LOG_BG = "#202124"
+LOG_FG = "#d4d4d1"
 LOG_INSERT = "#ffffff"
-LOG_SELECT_BG = "#264f78"
-LOG_FONT = ("Consolas", 10)
-MUTED = "#9aa0a6"
+LOG_SELECT_BG = "#2f4a66"
+LOG_FIND_BG = "#5c4a1a"      # every match of the find box
+LOG_FIND_CURRENT = "#9c7a1c"  # the match the find box is on
+MUTED = "#8e9299"
+FAINT = "#6b6f76"            # captions under the muted text: kinds, pids, uptimes
 
 # Log syntax colors: dim the bracketed [timestamp]/[pid]/[level] noise so the actual
 # message stands out, and tint warnings/errors so they're scannable at a glance.
@@ -32,6 +47,12 @@ LOG_ERROR = "#f47067"  # soft red
 LOG_MATCH = re.compile(r"\[[^\]\n]*\]")  # bracketed segments
 LOG_ERROR_WORDS = ("error", "fatal", "exception", "critical", "[fail", "traceback")
 LOG_WARN_WORDS = ("warn", "deprecat")
+# A Text widget gets slower and heavier with every line it holds, so each log keeps only the
+# most recent lines (the control API's LogBuffer has its own, separate copy). Output is
+# drawn in batches rather than per line: a chatty server would otherwise flood the event loop.
+LOG_MAX_LINES = 5000
+LOG_TRIM_SLACK = 500   # trim in chunks, not a line at a time
+LOG_FLUSH_MS = 100
 
 # App rail (left-most icon strip) colors
 RAIL_BG = "#1b1b1c"
@@ -48,10 +69,13 @@ NAV_ACTIVE_BG = "#37373d"
 NAV_SECTION_FG = "#7d8590"  # dim label for section headers (SERVICES / LOGS / ...)
 SHARED_FG = "#7d8590"       # the "shared between apps" marker
 
-# Status indicator colors
-RUNNING_COLOR = "#3fb950"    # green
-STOPPED_COLOR = "#6e7681"    # gray
-ATTENTION_COLOR = "#d29922"  # amber — e.g. a Windows service that can't be found
+# Status lamps. Each colour means one thing everywhere it appears; nothing else in the
+# interface uses them, so a lit lamp always reads as state.
+RUNNING_COLOR = "#46c37b"    # live
+STOPPED_COLOR = "#5d626b"    # off
+ATTENTION_COLOR = "#e0a43a"  # starting / pending / a Windows service that can't be found
+FAULT_COLOR = "#ef6b5f"      # exited on its own with an error
+LAMP_OFF = "#44474d"         # an unlit lamp: dimmer than the "Stopped" text beside it
 
 # Content background (matches the root/theme dark), used for scroll canvases
 PAGE_BG = "#1c1c1c"
@@ -59,6 +83,8 @@ PAGE_BG = "#1c1c1c"
 # Marks a service more than one app uses. Spelled out rather than drawn as a glyph:
 # arrow/link symbols collapse into an ambiguous "=" at sidebar font sizes.
 SHARED_TEXT = "shared"
+# A shared service's page belongs to no single project, so its header rule is neutral.
+SHARED_RULE_COLOR = "#4a4d54"
 
 # The settings page hangs off the rail rather than any one app, so it gets a fixed page id
 # and a neutral (non app-coloured) active tile.
@@ -142,6 +168,57 @@ def page_key(kind, app_id):
     return f"@{kind}:{app_id}"
 
 
+def pick_fonts(root):
+    """Point the font names at families this machine actually has.
+
+    Tk substitutes a missing family silently and badly (a missing mono face comes out
+    proportional), so a Windows 10 box gets the plain Segoe UI / Consolas it does have."""
+    global UI_FONT, UI_STRONG_FONT, SMALL_FONT, DISPLAY_FONT, MONO_FONT
+    families = set(tkfont.families(root))
+
+    def first(*names):
+        return next((n for n in names if n in families), names[-1])
+
+    UI_FONT = first("Segoe UI Variable Text", "Segoe UI")
+    UI_STRONG_FONT = first("Segoe UI Variable Text Semibold", "Segoe UI Semibold", "Segoe UI")
+    SMALL_FONT = first("Segoe UI Variable Small", "Segoe UI")
+    DISPLAY_FONT = first("Segoe UI Variable Display Semib", "Segoe UI Semibold", "Segoe UI")
+    MONO_FONT = first("Cascadia Mono", "Consolas")
+
+
+def show_if(widget, visible):
+    """grid() or grid_remove() a widget, touching it only when that actually changes."""
+    if widget is None or getattr(widget, "_shown", None) == visible:
+        return
+    widget._shown = visible
+    if visible:
+        widget.grid()
+    else:
+        widget.grid_remove()
+
+
+def format_uptime(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+    return f"{seconds // 86400}d {seconds % 86400 // 3600}h"
+
+
+def set_if_changed(widget, **options):
+    """configure() only the options whose value actually differs.
+
+    The status tick runs every second over every dot, pill and button; re-setting an
+    unchanged option still makes Tk redraw the widget, which is most of the app's idle CPU.
+    Compares against cget() rather than a cache, so a change made elsewhere is still seen."""
+    changed = {k: v for k, v in options.items() if str(widget.cget(k)) != str(v)}
+    if changed:
+        widget.configure(**changed)
+
+
 class UIManager:
     def __init__(self, root, service_manager, ui_scale=1.0):
         self.root = root
@@ -153,6 +230,11 @@ class UIManager:
         self.last_page_by_app = {}   # app id -> page id, so switching back restores context
 
         self.service_tabs = {}
+        self.find_entries = {}  # page id -> the find box of the log on that page
+        # Every line the logs show, kept so the control API can hand it to Claude Code & co.
+        self.log_buffer = LogBuffer()
+        self.pending_output = deque()    # (service name, text) awaiting _flush_output
+        self.output_flush_scheduled = False
         self.redis_trees = {}         # service name -> Treeview listing Redis lists
         self.redis_count_labels = {}  # service name -> "N list(s)" label
 
@@ -174,7 +256,7 @@ class UIManager:
 
         # Per-app dashboard widgets
         self.home_logs = {}          # app id -> activity log Text
-        self.home_status_dots = {}   # app id -> {service name: dot}
+        self.dash_rows = {}          # app id -> {service name: dashboard row widgets}
         self.summary_labels = {}     # app id -> (running label, stopped label)
         self.startup_vars = {}       # app id -> {name: (start_all_var, autostart_var)}
         self.services_tables = {}    # app id -> frame holding the dashboard services grid
@@ -216,16 +298,29 @@ class UIManager:
         return int(round(n * self.ui_scale))
 
     def _init_styles(self):
-        """Tweak the Sun Valley theme: roomier buttons and section/header labels."""
+        """Tweak the Sun Valley theme: the app's type scale, and roomier buttons."""
+        pick_fonts(self.root)
         style = ttk.Style()
-        bpad = (self._px(14), self._px(8))
-        style.configure("TButton", padding=bpad, font=("Segoe UI", 10))
-        style.configure("Accent.TButton", padding=bpad, font=("Segoe UI", 10))
-        style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"))
-        style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"))
-        style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground=MUTED)
-        style.configure("Section.TLabel", font=("Segoe UI", 10, "bold"))
-        style.configure("Mono.TLabel", font=("Consolas", 9), foreground=MUTED)
+        bpad = (self._px(14), self._px(7))
+        style.configure("TButton", padding=bpad, font=(UI_FONT, 10))
+        style.configure("Accent.TButton", padding=bpad, font=(UI_FONT, 10))
+        # Row-level controls on the dashboard: same buttons, sized to sit inside a list row.
+        spad = (self._px(10), self._px(3))
+        style.configure("Small.TButton", padding=spad, font=(UI_FONT, 9))
+        style.configure("Small.Accent.TButton", padding=spad, font=(UI_FONT, 9))
+        style.configure("Title.TLabel", font=(DISPLAY_FONT, 20))
+        style.configure("Header.TLabel", font=(DISPLAY_FONT, 17))
+        style.configure("Section.TLabel", font=(UI_STRONG_FONT, 10))
+        style.configure("State.TLabel", font=(UI_STRONG_FONT, 10))
+        style.configure("Row.TLabel", font=(UI_FONT, 10))
+        # sv_ttk maps TLabel's foreground per state, and a map beats configure(), so the
+        # dimmed styles set theirs through map() as well.
+        for name, font, color in (("Subtitle.TLabel", (UI_FONT, 10), MUTED),
+                                  ("Mono.TLabel", (MONO_FONT, 9), MUTED),
+                                  ("FaintMono.TLabel", (MONO_FONT, 9), FAINT),
+                                  ("Faint.TLabel", (SMALL_FONT, 9), FAINT)):
+            style.configure(name, font=font, foreground=color)
+            style.map(name, foreground=[("disabled", FAINT), ("!disabled", color)])
 
     # ------------------------------------------------------------------ layout
 
@@ -239,12 +334,13 @@ class UIManager:
         sidebar.pack_propagate(False)  # keep a fixed width
 
         brand_box = tk.Frame(sidebar, bg=SIDEBAR_BG)
-        brand_box.pack(fill="x", padx=self._px(16), pady=(self._px(16), self._px(8)))
+        brand_box.pack(fill="x", padx=self._px(16), pady=(self._px(16), self._px(10)))
         self.brand_label = tk.Label(brand_box, text="", bg=SIDEBAR_BG, fg="#ffffff",
-                                    font=("Segoe UI", 13, "bold"), anchor="w")
+                                    font=(DISPLAY_FONT, 13), anchor="w")
         self.brand_label.pack(fill="x")
-        self.brand_sub = tk.Label(brand_box, text="OnCodes Dev", bg=SIDEBAR_BG, fg=NAV_SECTION_FG,
-                                  font=("Segoe UI", 8), anchor="w")
+        # The project's live count, so it's in view from any page, not just the dashboard.
+        self.brand_sub = tk.Label(brand_box, text="", bg=SIDEBAR_BG, fg=NAV_SECTION_FG,
+                                  font=(SMALL_FONT, 9), anchor="w")
         self.brand_sub.pack(fill="x")
 
         # Scrollable nav area, so a long service list doesn't overflow small windows.
@@ -269,6 +365,7 @@ class UIManager:
             start_app = self.apps[0]["id"] if self.apps else None
         self.switch_app(start_app)
 
+        self.root.bind_all("<Control-f>", self._focus_find)  # find in the open page's log
         self._refresh_status()   # begin polling running/stopped state
         self._start_log_tails()  # stream configured log files into their pages
         self.root.after(800, self.autostart_services)
@@ -438,7 +535,7 @@ class UIManager:
 
         for app_id, t in self.rail_tiles.items():
             active = app_id == self.current_app and not settings_open
-            t["indicator"].configure(bg=RAIL_INDICATOR if active else RAIL_BG)
+            set_if_changed(t["indicator"], bg=RAIL_INDICATOR if active else RAIL_BG)
 
             running = sum(1 for n in self.service_manager.services_for_app(app_id)
                           if not self.service_manager.is_task(n)
@@ -457,7 +554,7 @@ class UIManager:
 
         tile = self.settings_tile
         if tile is not None:
-            tile["indicator"].configure(bg=RAIL_INDICATOR if settings_open else RAIL_BG)
+            set_if_changed(tile["indicator"], bg=RAIL_INDICATOR if settings_open else RAIL_BG)
             key = (settings_open, tile["hovered"] and not settings_open)
             if key != tile["key"]:
                 photo = self._render_settings_tile(tile["size"], *key)
@@ -470,7 +567,7 @@ class UIManager:
         tip = tk.Toplevel(self.root)
         tip.wm_overrideredirect(True)  # borderless, no title bar
         tip.attributes("-topmost", True)
-        tk.Label(tip, text=text, bg="#2b2b2c", fg="#e6e6e6", font=("Segoe UI", 9),
+        tk.Label(tip, text=text, bg="#2b2b2c", fg="#e6e6e6", font=(UI_FONT, 9),
                  padx=self._px(8), pady=self._px(4), bd=0).pack()
         tip.wm_geometry(f"+{event.x_root + self._px(14)}+{event.y_root}")
         self._tooltip = tip
@@ -511,7 +608,7 @@ class UIManager:
             if key == self.current_page:
                 self.current_page = None  # don't try to unpack a destroyed page later
 
-        for store in (self.home_logs, self.home_status_dots, self.summary_labels,
+        for store in (self.home_logs, self.dash_rows, self.summary_labels,
                       self.startup_vars, self.services_tables, self.home_scrolls,
                       self.build_logs, self.build_entries, self.build_buttons):
             store.clear()
@@ -552,7 +649,7 @@ class UIManager:
         self.redis_trees.pop(name, None)
         self.redis_count_labels.pop(name, None)
         self.status_dots.pop(name, None)
-        for dots in self.home_status_dots.values():
+        for dots in self.dash_rows.values():
             dots.pop(name, None)
         for rows in self.startup_vars.values():
             rows.pop(name, None)
@@ -691,7 +788,7 @@ class UIManager:
             for name in process_services:
                 self._add_nav_item(name, name, with_dot=True, shared=sm.is_shared(name))
         if win_services:
-            self._add_nav_section("Windows Services")
+            self._add_nav_section("Windows services")
             for name in win_services:
                 self._add_nav_item(name, name, with_dot=True, shared=sm.is_shared(name))
 
@@ -701,7 +798,7 @@ class UIManager:
             for section in dict.fromkeys(sm.services[n].get("section", "Tasks") for n in tasks):
                 self._add_nav_section(section)
                 for name in [n for n in tasks if sm.services[n].get("section", "Tasks") == section]:
-                    self._add_nav_item(name, name, with_dot=False)
+                    self._add_nav_item(name, name, with_dot=True)
 
         if log_views:
             self._add_nav_section("Logs")
@@ -709,10 +806,10 @@ class UIManager:
                 self._add_nav_item(name, name, with_dot=False, shared=sm.is_shared(name))
 
     def _add_nav_section(self, title):
-        """A dim, uppercase divider label separating groups of nav items."""
-        label = tk.Label(self.nav_frame, text=title.upper(), bg=SIDEBAR_BG, fg=NAV_SECTION_FG,
-                         font=("Segoe UI", 8, "bold"), anchor="w")
-        label.pack(fill="x", padx=self._px(22), pady=(self._px(12), self._px(2)))
+        """A dim divider label separating groups of nav items."""
+        label = tk.Label(self.nav_frame, text=title, bg=SIDEBAR_BG, fg=NAV_SECTION_FG,
+                         font=(SMALL_FONT, 9), anchor="w")
+        label.pack(fill="x", padx=self._px(20), pady=(self._px(12), self._px(2)))
         label.bind("<MouseWheel>", self._on_nav_mousewheel)
 
     def _start_log_tails(self):
@@ -722,34 +819,40 @@ class UIManager:
                 self.service_manager.start_log_tail(name, self.append_output)
 
     def _add_nav_item(self, page_id, text, with_dot, shared=False):
-        """Add a clickable sidebar row (with an optional status dot / shared marker)."""
+        """Add a clickable sidebar row: selection bar, status lamp, name, shared marker."""
         row = tk.Frame(self.nav_frame, bg=SIDEBAR_BG)
         row.pack(fill="x")
+        # Lit in the project's colour on the page in view, so the sidebar says which
+        # project you're in as well as which page.
+        bar = tk.Frame(row, bg=SIDEBAR_BG, width=self._px(3))
+        bar.pack(side="left", fill="y")
         inner = tk.Frame(row, bg=SIDEBAR_BG)
-        inner.pack(fill="x", padx=self._px(8), pady=self._px(1))
+        inner.pack(side="left", fill="x", expand=True)
 
+        # The lamp: a short bar in the state's colour (see _state). Rows without a run
+        # state get the same-sized gap so every name lines up.
+        lamp = tk.Frame(inner, bg=SIDEBAR_BG, width=self._px(3), height=self._px(14))
+        lamp.pack(side="left", padx=(self._px(13), self._px(10)))
         if with_dot:
-            dot = tk.Label(inner, text="●", bg=SIDEBAR_BG, fg=STOPPED_COLOR,
-                           font=("Segoe UI", 9), width=2)
-            self.status_dots[page_id] = dot
-        else:
-            dot = tk.Label(inner, text="", bg=SIDEBAR_BG, width=2)  # spacer to align text
-        dot.pack(side="left", padx=(self._px(6), self._px(4)), pady=self._px(8))
+            self.status_dots[page_id] = lamp
 
         label = tk.Label(inner, text=text, bg=SIDEBAR_BG, fg=NAV_FG,
-                         font=("Segoe UI", 10), anchor="w")
-        label.pack(side="left", fill="x", expand=True, pady=self._px(8))
+                         font=(UI_FONT, 10), anchor="w")
+        label.pack(side="left", fill="x", expand=True, pady=self._px(5))
 
-        widgets = [row, inner, dot, label]
+        widgets = [row, inner, label]
         if shared:
             mark = tk.Label(inner, text=SHARED_TEXT, bg=SIDEBAR_BG, fg=SHARED_FG,
-                            font=("Segoe UI", 8))
-            mark.pack(side="right", padx=(0, self._px(10)))
+                            font=(SMALL_FONT, 8))
+            mark.pack(side="right", padx=(0, self._px(12)))
             widgets.append(mark)
 
-        self.nav_items[page_id] = {"widgets": widgets, "text": label}
+        # lamp_color None = unlit: the lamp takes the row's background, so it disappears
+        # into a hovered or selected row instead of leaving a dark notch.
+        self.nav_items[page_id] = {"widgets": widgets, "text": label, "bar": bar,
+                                   "lamp": lamp, "lamp_color": None}
 
-        for w in widgets:
+        for w in widgets + [lamp]:
             w.bind("<Button-1>", lambda e, p=page_id: self.show_page(p))
             w.bind("<Enter>", lambda e, p=page_id: self._on_nav_hover(p, True))
             w.bind("<Leave>", lambda e, p=page_id: self._on_nav_hover(p, False))
@@ -780,8 +883,20 @@ class UIManager:
         self.show_page(SETTINGS_PAGE)
 
     def _set_nav_bg(self, page_id, color):
-        for w in self.nav_items[page_id]["widgets"]:
+        item = self.nav_items[page_id]
+        for w in item["widgets"]:
             w.configure(bg=color)
+        item["bg"] = color
+        if item["lamp_color"] is None:
+            item["lamp"].configure(bg=color)
+
+    def _set_lamp(self, page_id, color):
+        """Light (or, with None, darken) a sidebar row's status lamp."""
+        item = self.nav_items.get(page_id)
+        if item is None:
+            return
+        item["lamp_color"] = color
+        set_if_changed(item["lamp"], bg=color or item.get("bg", SIDEBAR_BG))
 
     def _on_nav_hover(self, page_id, entering):
         if page_id == self.current_page or page_id not in self.nav_items:
@@ -789,9 +904,16 @@ class UIManager:
         self._set_nav_bg(page_id, NAV_HOVER_BG if entering else SIDEBAR_BG)
 
     def _update_nav_highlight(self, active):
+        accent = self._app_color()
         for page_id, item in self.nav_items.items():
             self._set_nav_bg(page_id, NAV_ACTIVE_BG if page_id == active else SIDEBAR_BG)
             item["text"].configure(fg="#ffffff" if page_id == active else NAV_FG)
+            item["bar"].configure(bg=accent if page_id == active else SIDEBAR_BG)
+
+    def _app_color(self, app_id=None):
+        """The project's own colour (from its definition), used to mark where you are."""
+        app = self.service_manager.app_by_id.get(app_id or self.current_app) or {}
+        return app.get("color") or "#8e9299"
 
     # ----------------------------------------------------------- status dots
 
@@ -811,70 +933,104 @@ class UIManager:
         self._apply_status()
         self.root.after(1000, self._refresh_status)
 
+    def _state(self, name):
+        """(label, colour) for a service's live state: the single source every lamp and
+        state label reads, so the sidebar, dashboard and page can never disagree.
+        A colour of None means the lamp stays unlit."""
+        sm = self.service_manager
+        if sm.is_logview(name):
+            return "", None
+        if sm.is_task(name):
+            if sm.task_running(name):
+                return "Running", RUNNING_COLOR
+            code = sm.task_exit_codes.get(name)
+            if code is None:
+                return "Not run yet", None
+            return ("Finished", None) if code == 0 else (f"Failed, exit {code}", FAULT_COLOR)
+        if sm.is_winservice(name):
+            state = sm.winservice_status.get(name)
+            return {"running": ("Running", RUNNING_COLOR),
+                    "stopped": ("Stopped", STOPPED_COLOR),
+                    "pending": ("Changing state", ATTENTION_COLOR),
+                    "not_found": ("Not installed", ATTENTION_COLOR),
+                    }.get(state, ("Checking", STOPPED_COLOR))
+        if name in sm.starting:
+            return "Starting", ATTENTION_COLOR
+        if sm.is_running(name):
+            return "Running", RUNNING_COLOR
+        code = sm.exit_codes.get(name)
+        if code:
+            return f"Crashed, exit {code}", FAULT_COLOR
+        return ("Exited", STOPPED_COLOR) if code == 0 else ("Stopped", STOPPED_COLOR)
+
+    def _detail(self, name):
+        """pid and uptime of a running service, for the faint text beside its state."""
+        sm = self.service_manager
+        if sm.is_winservice(name):
+            pid = sm.winservice_pids.get(name) if sm.is_winservice_running(name) else 0
+            return f"pid {pid}" if pid else ""
+        proc = sm.processes.get(name)
+        if not hasattr(proc, "pid") or not sm.is_running(name):
+            return ""
+        started = sm.started_at.get(name)
+        up = f"  up {format_uptime(time.time() - started)}" if started else ""
+        return f"pid {proc.pid}{up}"
+
     def _apply_status(self):
         sm = self.service_manager
         for name in sm.services:
             running = self._is_running(name)
-            # Flag a misconfigured / uninstalled Windows service in amber so it's obvious.
-            if self._is_winservice(name) and sm.winservice_status.get(name) == "not_found":
-                color = ATTENTION_COLOR
-            else:
-                color = RUNNING_COLOR if running else STOPPED_COLOR
+            label, color = self._state(name)
+            detail = self._detail(name)
 
-            dot = self.status_dots.get(name)  # only the current app's nav has dots
-            if dot is not None:
-                dot.configure(fg=color)
+            lamp = LAMP_OFF if color == STOPPED_COLOR else color
+            self._set_lamp(name, lamp)  # only the current app's nav has lamps
 
-            for app_dots in self.home_status_dots.values():
-                home_dot = app_dots.get(name)
-                if home_dot is not None:
-                    home_dot.configure(foreground=color)
+            for rows in self.dash_rows.values():
+                row = rows.get(name)
+                if row is not None:
+                    set_if_changed(row["lamp"], bg=lamp or LAMP_OFF)
+                    set_if_changed(row["state"], text=label, foreground=color or MUTED)
+                    set_if_changed(row["detail"], text=detail)
+                    self._show_run_controls(row, name, running)
 
-            pill = self.service_tabs.get(name, {}).get("status_pill")
-            if pill is not None:  # live status pill on the service page
-                if color == ATTENTION_COLOR:
-                    label = "Not found"
-                elif running:
-                    label = "Running" if not self._is_task(name) else "Running…"
-                else:
-                    label = "Stopped" if not self._is_task(name) else "Idle"
-                pill.configure(text=f"● {label}", foreground=color)
-
-            self._update_buttons(name, running)
+            tab = self.service_tabs.get(name, {})
+            pill = tab.get("status_pill")
+            if pill is not None:  # live state beside the service page's title
+                set_if_changed(pill, text=label, foreground=color or MUTED)
+                set_if_changed(tab["status_detail"], text=detail)
+            self._show_run_controls(tab, name, running)
 
         self._update_summary()
         self._update_rail()
 
     def _update_summary(self):
-        """The current app's running/stopped badges (its own + shared services)."""
+        """The current app's running count, on its dashboard and under the sidebar title."""
         if not self.current_app:
             return
         names = [n for n in self.service_manager.services_for_app(self.current_app)
                  if not self._is_logview(n) and not self._is_task(n)]
         running = sum(1 for n in names if self._is_running(n))
-        labels = self.summary_labels.get(self.current_app)
-        if labels:
-            labels[0].configure(text=f"● {running} running")
-            labels[1].configure(text=f"● {len(names) - running} stopped")
+        crashed = sum(1 for n in names if self._state(n)[1] == FAULT_COLOR)
+        text = f"{running} of {len(names)} running" + (f", {crashed} crashed" if crashed else "")
+        label = self.summary_labels.get(self.current_app)
+        if label is not None:
+            set_if_changed(label, text=text)
+        if self.brand_sub is not None:
+            set_if_changed(self.brand_sub, text=text)
 
-    def _update_buttons(self, name, running):
-        tab = self.service_tabs.get(name, {})
+    def _show_run_controls(self, controls, name, running):
+        """Show only the actions that make sense now: Start when it's stopped, Stop and
+        Restart when it's running (and Run / Cancel for a task). A hidden button can't be
+        clicked by mistake, and the one you want is always in the same place."""
         if self._is_task(name):
-            run_btn, cancel_btn = tab.get("run_button"), tab.get("cancel_button")
-            if run_btn:
-                run_btn.configure(state="disabled" if running else "normal")
-            if cancel_btn:
-                cancel_btn.configure(state="normal" if running else "disabled")
+            show_if(controls.get("run_button"), not running)
+            show_if(controls.get("cancel_button"), running)
             return
-        start = tab.get("start_button")
-        stop = tab.get("stop_button")
-        restart = tab.get("restart_button")
-        if start:
-            start.configure(state="disabled" if running else "normal")
-        if stop:
-            stop.configure(state="normal" if running else "disabled")
-        if restart:
-            restart.configure(state="normal" if running else "disabled")
+        starting = name in self.service_manager.starting
+        show_if(controls.get("start_button"), not running and not starting)
+        show_if(controls.get("stop_button"), running or starting)
+        show_if(controls.get("restart_button"), running)
 
     def _sync_winservice_name(self, name):
         """Persist any edit to a winservice's service-name field before we act on it."""
@@ -913,7 +1069,7 @@ class UIManager:
             frame, wrap=tk.WORD, height=height,
             bg=LOG_BG, fg=LOG_FG, insertbackground=LOG_INSERT,
             selectbackground=LOG_SELECT_BG, relief="flat", borderwidth=0,
-            highlightthickness=0, font=LOG_FONT,
+            highlightthickness=0, font=(MONO_FONT, 10),
             padx=self._px(14), pady=self._px(10),
             # Breathing room between entries so the log reads as separated blocks.
             spacing1=self._px(2), spacing2=self._px(1), spacing3=self._px(4),
@@ -926,27 +1082,192 @@ class UIManager:
         # Indent wrapped continuation lines (lmargin is a tag-only option) so a long
         # entry reads as one indented block instead of clutter.
         text.tag_configure("body", lmargin2=self._px(22))
+        # Find matches; raised above the colour tags so a match is visible on any line.
+        text.tag_configure("find", background=LOG_FIND_BG)
+        text.tag_configure("find_current", background=LOG_FIND_CURRENT, foreground="#ffffff")
+        text.tag_raise("find")
+        text.tag_raise("find_current")
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
-        text.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill='y')
         text.pack(side=tk.LEFT, fill='both', expand=True)
+
+        # Whether the log sticks to its newest line. Scrolling up to read something turns
+        # it off until you scroll back to the bottom. A log on a page that isn't showing
+        # isn't scrolled at all (see() is the expensive part of appending); it catches up
+        # once its page is shown.
+        text.follow = True
+        text.on_follow = None  # set by _add_log_tools to show / hide "Jump to latest"
+        text.find_pattern = ""
+
+        def on_scroll(first, last):
+            scrollbar.set(first, last)
+            if text.winfo_ismapped():
+                following = float(last) >= 0.999
+                if following != text.follow:
+                    text.follow = following
+                    if text.on_follow:
+                        text.on_follow(following)
+
+        text.configure(yscrollcommand=on_scroll)
+        text.bind("<Map>", lambda e: text.follow and text.see("end"), add="+")
         return text
 
+    def _add_log_tools(self, bar, text, page_id, clear):
+        """Find, Jump to latest and Clear for a log, packed right-aligned into `bar`.
+
+        Find highlights every match as you type; Enter / Shift+Enter step through them and
+        Escape clears. Ctrl+F jumps here from anywhere on the page."""
+        ttk.Button(bar, text="Clear", style="Small.TButton", command=clear).pack(side='right')
+        jump = ttk.Button(bar, text="Jump to latest", style="Small.Accent.TButton",
+                          command=lambda: (text.see("end"), setattr(text, "follow", True),
+                                           jump.pack_forget()))
+
+        def on_follow(following):
+            if following:
+                jump.pack_forget()
+            elif not jump.winfo_ismapped():
+                jump.pack(side='right', padx=(0, self._px(8)), before=find_box)
+
+        text.on_follow = on_follow
+
+        find_box = ttk.Frame(bar)
+        find_box.pack(side='right', padx=(0, self._px(12)))
+        count = ttk.Label(find_box, text="", style="Faint.TLabel", width=12, anchor='e')
+        count.pack(side='left', padx=(0, self._px(8)))
+        entry = ttk.Entry(find_box, width=24, font=(MONO_FONT, 9))
+        entry.pack(side='left')
+        placeholder = "Find in output"
+
+        def show_placeholder(_e=None):
+            if not entry.get():
+                entry.insert(0, placeholder)
+                entry.configure(foreground=FAINT)
+
+        def hide_placeholder(_e=None):
+            if entry.get() == placeholder and str(entry.cget("foreground")) == FAINT:
+                entry.delete(0, "end")
+                entry.configure(foreground=LOG_FG)
+
+        def query():
+            value = entry.get()
+            return "" if value == placeholder and str(entry.cget("foreground")) == FAINT else value
+
+        def update_count():
+            n = len(text.tag_ranges("find")) // 2
+            if not text.find_pattern:
+                count.configure(text="")
+            else:
+                cur = text.tag_ranges("find_current")
+                if n and cur:
+                    pos = [str(r) for r in text.tag_ranges("find")[::2]].index(str(cur[0])) + 1
+                    count.configure(text=f"{pos} of {n}")
+                else:
+                    count.configure(text=f"{n} match{'es' if n != 1 else ''}" if n else "No matches")
+
+        def search(_e=None):
+            pattern = query()
+            if pattern == text.find_pattern:
+                return
+            text.find_pattern = pattern
+            text.tag_remove("find", "1.0", "end")
+            text.tag_remove("find_current", "1.0", "end")
+            if pattern:
+                self._highlight_matches(text, "1.0")
+            update_count()
+
+        def step(backwards=False):
+            search()
+            ranges = text.tag_ranges("find")
+            if not ranges:
+                return "break"
+            cur = text.tag_ranges("find_current")
+            starts = ranges[::2]
+            if cur:
+                text.tag_remove("find_current", "1.0", "end")
+                idx = [str(r) for r in starts].index(str(cur[0]))
+                idx = (idx - 1) % len(starts) if backwards else (idx + 1) % len(starts)
+            else:
+                idx = len(starts) - 1 if backwards else 0
+            start = starts[idx]
+            end = text.index(f"{start}+{len(text.find_pattern)}c")
+            text.tag_add("find_current", start, end)
+            text.see(start)
+            update_count()
+            return "break"
+
+        def clear_find(_e=None):
+            entry.delete(0, "end")
+            search()
+            text.focus_set()
+            return "break"
+
+        entry.bind("<FocusIn>", hide_placeholder)
+        entry.bind("<FocusOut>", show_placeholder)
+        entry.bind("<KeyRelease>", lambda e: e.keysym in ("Return", "Escape") or search())
+        entry.bind("<Return>", lambda e: step())
+        entry.bind("<Shift-Return>", lambda e: step(backwards=True))
+        entry.bind("<Escape>", clear_find)
+        text.find_count = update_count
+        show_placeholder()
+        self.find_entries[page_id] = entry
+
+    def _highlight_matches(self, text, start):
+        """Tag every case-insensitive match of the log's find pattern from `start` on."""
+        pattern = text.find_pattern
+        if not pattern:
+            return
+        length = tk.IntVar()
+        pos = start
+        while True:
+            pos = text.search(pattern, pos, stopindex="end", nocase=True, count=length)
+            if not pos or not length.get():
+                break
+            end = f"{pos}+{length.get()}c"
+            text.tag_add("find", pos, end)
+            pos = end
+
+    def _focus_find(self, _event=None):
+        entry = self.find_entries.get(self.current_page)
+        if entry is not None:
+            entry.focus_set()
+            entry.select_range(0, "end")
+            return "break"
+
     def _append_log(self, widget, line):
-        """Append one line to a log Text, colour-coding it: bracketed metadata dimmed,
-        and the whole line tinted amber/red if it looks like a warning/error."""
-        widget.insert("end", line + "\n")
-        lineno = int(widget.index("end-1c").split(".")[0]) - 1  # the line just inserted
-        widget.tag_add("body", f"{lineno}.0", f"{lineno}.end")  # wrapped-line indent
-        low = line.lower()
-        if any(w in low for w in LOG_ERROR_WORDS):
-            widget.tag_add("error", f"{lineno}.0", f"{lineno}.end")
-        elif any(w in low for w in LOG_WARN_WORDS):
-            widget.tag_add("warn", f"{lineno}.0", f"{lineno}.end")
-        for m in LOG_MATCH.finditer(line):
-            widget.tag_add("meta", f"{lineno}.{m.start()}", f"{lineno}.{m.end()}")
-        widget.see("end")
+        """Append one entry to a log Text (see _append_lines)."""
+        self._append_lines(widget, [line])
+
+    def _append_lines(self, widget, entries):
+        """Append entries to a log Text, colour-coding each line: bracketed metadata dimmed,
+        and the whole line tinted amber/red if it looks like a warning/error. Then trim the
+        log to LOG_MAX_LINES and scroll to the end once, if it's following."""
+        mapped = widget.winfo_ismapped()
+        if mapped:
+            widget.follow = widget.yview()[1] >= 0.999
+        lineno = int(widget.index("end-1c").split(".")[0])  # the next line to be written
+        first = lineno
+        for entry in entries:
+            for line in str(entry).split("\n"):
+                low = line.lower()
+                tags = ["body"]  # wrapped-line indent
+                if any(w in low for w in LOG_ERROR_WORDS):
+                    tags.append("error")
+                elif any(w in low for w in LOG_WARN_WORDS):
+                    tags.append("warn")
+                widget.insert("end", line + "\n", tuple(tags))
+                for m in LOG_MATCH.finditer(line):
+                    widget.tag_add("meta", f"{lineno}.{m.start()}", f"{lineno}.{m.end()}")
+                lineno += 1
+        if getattr(widget, "find_pattern", ""):  # keep an open search covering new output
+            self._highlight_matches(widget, f"{first}.0")
+        excess = lineno - 1 - LOG_MAX_LINES
+        if excess > LOG_TRIM_SLACK:
+            widget.delete("1.0", f"{excess + 1}.0")
+        if getattr(widget, "find_pattern", ""):
+            widget.find_count()
+        if mapped and widget.follow:
+            widget.see("end")
 
     # -------------------------------------------------------- layout helpers
 
@@ -1007,64 +1328,69 @@ class UIManager:
 
     # ------------------------------------------------------------ dashboard
 
+    def _page_rule(self, parent, color):
+        """The 2px rule under a page header, in the project's colour: where you are."""
+        tk.Frame(parent, height=self._px(2), bg=color).pack(fill="x", pady=(0, self._px(16)))
+
+    def _link(self, parent, text, command, danger=False):
+        """A quiet text button for secondary actions (Edit, Remove), kept visually apart
+        from the run controls. Focusable, and Enter/Space activate it like a button."""
+        hover = FAULT_COLOR if danger else "#ffffff"
+        link = tk.Label(parent, text=text, bg=PAGE_BG, fg=MUTED, font=(UI_FONT, 10),
+                        cursor="hand2", takefocus=True, padx=self._px(6), pady=self._px(4),
+                        highlightthickness=1, highlightbackground=PAGE_BG,
+                        highlightcolor=MUTED)
+        link.bind("<Enter>", lambda e: link.configure(fg=hover))
+        link.bind("<Leave>", lambda e: link.configure(fg=MUTED))
+        for seq in ("<Button-1>", "<Return>", "<space>"):
+            link.bind(seq, lambda e: command())
+        return link
+
+    def _tooltip_on(self, widget, text):
+        widget.bind("<Enter>", lambda e: self._show_tooltip(e, text), add="+")
+        widget.bind("<Leave>", lambda e: self._hide_tooltip(), add="+")
+
     def _build_home_page(self, page, app_id):
-        """Per-app dashboard: status summary, bulk controls, services table and activity."""
+        """Per-app dashboard: the switchboard of services, bulk controls and activity."""
         app = self.service_manager.app_by_id[app_id]
         scroll = self._make_scroll_area(page)
         self.home_scrolls[app_id] = scroll
-        container = ttk.Frame(scroll, padding=self._px(24))
+        container = ttk.Frame(scroll, padding=(self._px(28), self._px(22)))
         container.pack(expand=True, fill='both')
 
-        # --- Header: title + live running/stopped summary badges ---
+        # --- Header: project, its live count, and the bulk controls ---
         header = ttk.Frame(container)
-        header.pack(fill='x', pady=(0, self._px(18)))
-
+        header.pack(fill='x', pady=(0, self._px(12)))
         titles = ttk.Frame(header)
         titles.pack(side='left', anchor='w')
         ttk.Label(titles, text=app.get("name", app_id), style="Title.TLabel").pack(anchor='w')
-        ttk.Label(titles, text=f"Monitor and control the {app.get('name', app_id)} stack",
-                  style="Subtitle.TLabel").pack(anchor='w', pady=(2, 0))
+        summary = ttk.Label(titles, text="", style="Subtitle.TLabel")
+        summary.pack(anchor='w', pady=(self._px(2), 0))
+        self.summary_labels[app_id] = summary
 
-        badges = ttk.Frame(header)
-        badges.pack(side='right', anchor='e')
-        running_lbl = ttk.Label(badges, text="● 0 running", foreground=RUNNING_COLOR,
-                                font=("Segoe UI", 11, "bold"))
-        running_lbl.pack(side='left', padx=(0, self._px(16)))
-        stopped_lbl = ttk.Label(badges, text="● 0 stopped", foreground=STOPPED_COLOR,
-                                font=("Segoe UI", 11, "bold"))
-        stopped_lbl.pack(side='left')
-        self.summary_labels[app_id] = (running_lbl, stopped_lbl)
+        bulk = ttk.Frame(header)
+        bulk.pack(side='right', anchor='s')
+        ttk.Button(bulk, text="Start all", style="Accent.TButton",
+                   command=lambda: self.start_all(app_id)).pack(side=tk.LEFT, padx=(0, self._px(8)))
+        ttk.Button(bulk, text="Restart all",
+                   command=lambda: self.restart_all(app_id)).pack(side=tk.LEFT, padx=(0, self._px(8)))
+        stop_all = ttk.Button(bulk, text="Stop all", command=lambda: self.stop_all(app_id))
+        stop_all.pack(side=tk.LEFT)
+        self._tooltip_on(stop_all, "Shared services stay up while another project still uses them.")
+        self._page_rule(container, self._app_color(app_id))
 
-        # --- Bulk actions card ---
-        actions = self._card(container, "Bulk actions")
-        row = ttk.Frame(actions)
-        row.pack(anchor='w')
-        ttk.Button(row, text="Start All", width=14, style="Accent.TButton",
-                   command=lambda: self.start_all(app_id)).pack(side=tk.LEFT, padx=(0, self._px(10)))
-        ttk.Button(row, text="Restart All", width=14,
-                   command=lambda: self.restart_all(app_id)).pack(side=tk.LEFT, padx=(0, self._px(10)))
-        ttk.Button(row, text="Stop All", width=14,
-                   command=lambda: self.stop_all(app_id)).pack(side=tk.LEFT)
-        ttk.Label(actions,
-                  text=f"Scoped to {app.get('name', app_id)}. A service marked 'shared' is left "
-                       f"running while the other app still has its own services up.",
-                  style="Subtitle.TLabel").pack(anchor='w', pady=(self._px(10), 0))
-
-        # --- Services card (live status + startup options) ---
-        services = ttk.Frame(container, style="Card.TFrame", padding=self._px(16))
-        services.pack(fill='x', pady=(0, self._px(14)))
+        # --- Services: one row per service, with its state and its own controls ---
+        services = ttk.Frame(container, style="Card.TFrame", padding=(self._px(18), self._px(14)))
+        services.pack(fill='x', pady=(0, self._px(16)))
         head = ttk.Frame(services)
-        head.pack(fill='x', pady=(0, self._px(10)))
+        head.pack(fill='x', pady=(0, self._px(8)))
         ttk.Label(head, text="Services", style="Section.TLabel").pack(side='left')
-        ttk.Button(head, text="Add Service",
+        ttk.Button(head, text="Add service",
                    command=lambda: self.add_service_dialog(app_id)).pack(side='right')
-        ttk.Label(services,
-                  text='Live status, and which services Start All includes / start automatically.',
-                  style="Subtitle.TLabel").pack(anchor='w', pady=(0, self._px(10)))
         self._build_services_table(services, app_id)
 
         # --- Activity card ---
-        act = ttk.Frame(container, style="Card.TFrame", padding=self._px(16))
+        act = ttk.Frame(container, style="Card.TFrame", padding=(self._px(18), self._px(14)))
         act.pack(fill='both', expand=True)
         act_head = ttk.Frame(act)
         act_head.pack(fill='x', pady=(0, self._px(8)))
@@ -1084,21 +1410,21 @@ class UIManager:
     def _build_services_table(self, parent, app_id):
         """Create the dashboard services grid; its rows are (re)filled separately so adding
         or removing a service doesn't mean rebuilding the whole dashboard."""
-        # Left-anchored, content-width grid so the toggles stay next to their service
-        # names instead of being flung to the far edge on a wide/maximised window.
         box = ttk.Frame(parent)
-        box.pack(anchor='w')
+        box.pack(fill='x')
         self.services_tables[app_id] = box
         self._fill_services_table(app_id)
 
     def _fill_services_table(self, app_id):
-        """Rows of: live status dot | service | 'Start All' toggle | auto-start toggle."""
+        """Rows of: lamp | service | kind | state | pid, uptime | controls | the two
+        startup toggles. The state is the loudest thing in a row; the startup toggles,
+        which are configuration, sit quietly at the end."""
         box = self.services_tables.get(app_id)
         if box is None:
             return
         for child in box.winfo_children():
             child.destroy()
-        self.home_status_dots[app_id] = {}
+        self.dash_rows[app_id] = {}
         self.startup_vars[app_id] = {}
 
         sm = self.service_manager
@@ -1107,45 +1433,65 @@ class UIManager:
                 if not self._is_logview(n) and not self._is_task(n)]
 
         if not rows:
-            ttk.Label(box, text="No services yet — use Add Service to create one.",
+            ttk.Label(box, text="No services yet. Add one to start it from here.",
                       style="Subtitle.TLabel").grid(row=0, column=0, sticky='w')
             return
 
-        ttk.Label(box, text="Service", style="Section.TLabel").grid(
-            row=0, column=0, columnspan=2, sticky='w', pady=(0, self._px(6)))
-        ttk.Label(box, text='In Start All', style="Section.TLabel").grid(
-            row=0, column=2, padx=(self._px(40), self._px(14)), pady=(0, self._px(6)))
-        ttk.Label(box, text="Auto-start", style="Section.TLabel").grid(
-            row=0, column=3, padx=self._px(14), pady=(0, self._px(6)))
+        box.columnconfigure(4, weight=1)  # the gap that pushes controls to the right edge
+        pad = self._px(5)
+        for col, text in ((1, "Service"), (3, "State"), (6, "In Start all"), (7, "Auto-start")):
+            ttk.Label(box, text=text, style="Faint.TLabel").grid(
+                row=0, column=col, sticky='w' if col < 6 else '', padx=(0, self._px(18)),
+                pady=(0, self._px(4)))
 
         for i, name in enumerate(rows, start=1):
             info = sm.services[name]
 
-            dot = ttk.Label(box, text="●", foreground=STOPPED_COLOR)
-            dot.grid(row=i, column=0, sticky='w', padx=(0, self._px(8)), pady=self._px(3))
-            self.home_status_dots[app_id][name] = dot  # updated live by _apply_status
+            lamp = tk.Frame(box, bg=LAMP_OFF, width=self._px(4), height=self._px(22))
+            lamp.grid(row=i, column=0, sticky='w', padx=(0, self._px(12)), pady=pad)
 
-            # Clicking a name jumps to that service's page.
-            name_cell = ttk.Frame(box)
-            name_cell.grid(row=i, column=1, sticky='w', padx=(0, self._px(24)), pady=self._px(3))
-            name_lbl = ttk.Label(name_cell, text=name, cursor="hand2")
-            name_lbl.pack(side='left')
+            # Clicking a name opens that service's page.
+            name_lbl = ttk.Label(box, text=name, style="Row.TLabel", cursor="hand2")
+            name_lbl.grid(row=i, column=1, sticky='w', padx=(0, self._px(18)), pady=pad)
             name_lbl.bind("<Button-1>", lambda e, n=name: self.show_page(n))
+            kind = service_kind_label(info)
             if sm.is_shared(name):
-                ttk.Label(name_cell, text=SHARED_TEXT, style="Subtitle.TLabel").pack(
-                    side='left', padx=(self._px(8), 0))
+                kind += ", shared"
+            ttk.Label(box, text=kind, style="Faint.TLabel").grid(
+                row=i, column=2, sticky='w', padx=(0, self._px(18)), pady=pad)
+
+            state = ttk.Label(box, text="", style="State.TLabel")
+            state.grid(row=i, column=3, sticky='w', padx=(0, self._px(14)), pady=pad)
+            detail = ttk.Label(box, text="", style="FaintMono.TLabel")
+            detail.grid(row=i, column=4, sticky='w', pady=pad)
+
+            # Start, or Stop + Restart, in a fixed slot so the button you want doesn't move.
+            controls = ttk.Frame(box)
+            controls.grid(row=i, column=5, sticky='e', padx=(self._px(12), self._px(22)), pady=pad)
+            start = ttk.Button(controls, text="Start", style="Small.TButton", width=7,
+                               command=lambda n=name: self._do_start(n))
+            stop = ttk.Button(controls, text="Stop", style="Small.TButton", width=7,
+                              command=lambda n=name: self._do_stop(n))
+            restart = ttk.Button(controls, text="Restart", style="Small.TButton", width=7,
+                                 command=lambda n=name: self._do_restart(n))
+            start.grid(row=0, column=0)
+            stop.grid(row=0, column=1)
+            restart.grid(row=0, column=2, padx=(self._px(6), 0))
 
             sa_var = tk.BooleanVar(value=sm.includes_in_start_all(name, app_id))
             ttk.Checkbutton(box, variable=sa_var,
                             command=lambda n=name, a=app_id: self._on_toggle_start_all(n, a)).grid(
-                                row=i, column=2, padx=(self._px(40), self._px(14)), pady=self._px(3))
+                                row=i, column=6, padx=(0, self._px(18)), pady=pad)
 
             as_var = tk.BooleanVar(value=info.get("autostart", False))
             ttk.Checkbutton(box, variable=as_var,
                             command=lambda n=name, a=app_id: self._on_toggle_autostart(n, a)).grid(
-                                row=i, column=3, padx=self._px(14), pady=self._px(3))
+                                row=i, column=7, padx=(0, self._px(18)), pady=pad)
 
             self.startup_vars[app_id][name] = (sa_var, as_var)
+            self.dash_rows[app_id][name] = {  # updated live by _apply_status
+                "lamp": lamp, "state": state, "detail": detail,
+                "start_button": start, "stop_button": stop, "restart_button": restart}
 
         # Rows built after the page was first assembled need the wheel handler wiring up
         # again, or scrolling stalls whenever the pointer is over the new grid.
@@ -1274,153 +1620,87 @@ class UIManager:
     def _build_service_page(self, page, service_name, service_info):
         sm = self.service_manager
         is_task = sm.is_task(service_name)
+        is_logview = self._is_logview(service_name)
 
-        container = ttk.Frame(page, padding=self._px(24))
+        container = ttk.Frame(page, padding=(self._px(28), self._px(22)))
         container.pack(expand=True, fill='both')
         self.service_tabs[service_name] = {}
-
-        # --- Header: title + shared marker + live status pill ---
-        header = ttk.Frame(container)
-        header.pack(fill='x', pady=(0, self._px(16)))
-        ttk.Label(header, text=service_name, style="Header.TLabel").pack(side='left', anchor='w')
-        if sm.is_shared(service_name):
-            others = ", ".join(sm.app_by_id[a].get("name", a) for a in sm.apps_of(service_name))
-            ttk.Label(header, text=f"shared with {others}",
-                      style="Subtitle.TLabel").pack(side='left', anchor='w', padx=(self._px(10), 0))
-
-        status_pill = None
-        if not self._is_logview(service_name):  # log-only pages have no run state
-            status_pill = ttk.Label(header, text="●", foreground=STOPPED_COLOR,
-                                    font=("Segoe UI", 11, "bold"))
-            status_pill.pack(side='right', anchor='e')
-
-        # --- Configuration card (type-specific inputs) ---
-        cfg = self._card(container, "Configuration")
-
-        if "command" in service_info:
-            form = ttk.Frame(cfg)
-            form.pack(fill='x')
-            form.columnconfigure(1, weight=1)
-
-            ttk.Label(form, text="Directory").grid(row=0, column=0, sticky='w',
-                                                   padx=(0, self._px(8)), pady=self._px(3))
-            dir_entry = ttk.Entry(form)
-            dir_entry.insert(0, service_info.get("dir", ""))
-            dir_entry.grid(row=0, column=1, sticky='ew', pady=self._px(3))
-
-            ttk.Label(form, text="Command").grid(row=1, column=0, sticky='w',
-                                                 padx=(0, self._px(8)), pady=self._px(3))
-            command_entry = ttk.Entry(form)
-            command_entry.insert(0, " ".join(service_info["command"]))
-            command_entry.grid(row=1, column=1, sticky='ew', pady=self._px(3))
-
-            self.service_tabs[service_name].update(
-                {"dir_entry": dir_entry, "command_entry": command_entry})
-
-            # ${python} / ${project_dir} only mean something once expanded, so show the
-            # real command line that will run.
-            resolved = sm.resolve(service_name, "command", [])
-            if resolved != service_info["command"]:
-                ttk.Label(cfg, text="Runs: " + " ".join(resolved), style="Mono.TLabel").pack(
-                    anchor='w', pady=(self._px(10), 0))
-
-        elif "url" in service_info:
-            form = ttk.Frame(cfg)
-            form.pack(fill='x')
-            ttk.Label(form, text="URL").pack(side=tk.LEFT, padx=(0, self._px(8)))
-            url_entry = ttk.Entry(form)
-            url_entry.insert(0, service_info["url"])
-            url_entry.pack(side=tk.LEFT, fill='x', expand=True, padx=(0, self._px(12)))
-
-            ttk.Label(form, text="Interval (s)").pack(side=tk.LEFT, padx=(0, self._px(8)))
-            interval_entry = ttk.Entry(form, width=8)
-            interval_entry.insert(0, str(service_info["interval"]))
-            interval_entry.pack(side=tk.LEFT)
-
-            self.service_tabs[service_name].update(
-                {"url_entry": url_entry, "interval_entry": interval_entry})
-
-        elif service_info.get("type") == "winservice":
-            form = ttk.Frame(cfg)
-            form.pack(fill='x')
-            ttk.Label(form, text="Windows service name").pack(side=tk.LEFT, padx=(0, self._px(8)))
-            service_entry = ttk.Entry(form)
-            service_entry.insert(0, service_info.get("service_name", ""))
-            service_entry.pack(side=tk.LEFT, fill='x', expand=True)
-            self.service_tabs[service_name].update({"service_entry": service_entry})
-
-            ttk.Label(cfg,
-                      text="Controlling a Windows service needs administrator rights — "
-                           "accept the UAC prompt when it appears.",
-                      style="Subtitle.TLabel").pack(anchor='w', pady=(self._px(10), 0))
-
-        elif service_info.get("type") == "logview":
-            # Log-only page: no service to control, just a read-only path + the tailed log.
-            form = ttk.Frame(cfg)
-            form.pack(fill='x')
-            ttk.Label(form, text="Log file").pack(side=tk.LEFT, padx=(0, self._px(8)))
-            path_entry = ttk.Entry(form)
-            # Resolved, not raw: this is the one place the file itself is the subject, so
-            # showing `${wamp}\logs\...` would hide which file is actually being tailed.
-            path_entry.insert(0, sm.resolve(service_name, "log_file", ""))
-            path_entry.configure(state="readonly")
-            path_entry.pack(side=tk.LEFT, fill='x', expand=True)
-
-        # --- Actions toolbar ---
-        actions = ttk.Frame(container)
-        actions.pack(fill='x', pady=(0, self._px(14)))
-
         controls = {}
+
+        # --- Header: name, live state, then the run controls; Edit / Remove at the end ---
+        header = ttk.Frame(container)
+        header.pack(fill='x')
+        ttk.Label(header, text=service_name, style="Header.TLabel").pack(side='left', anchor='w')
+        if not is_logview:  # log-only pages have no run state
+            status_pill = ttk.Label(header, text="", style="State.TLabel")
+            status_pill.pack(side='left', padx=(self._px(16), 0), pady=(self._px(4), 0))
+            status_detail = ttk.Label(header, text="", style="FaintMono.TLabel")
+            status_detail.pack(side='left', padx=(self._px(10), 0), pady=(self._px(5), 0))
+            controls.update({"status_pill": status_pill, "status_detail": status_detail})
+
+        remove = self._link(header, "Remove", lambda: self.remove_service(service_name), danger=True)
+        remove.pack(side='right')
+        self._link(header, "Edit", lambda: self.edit_service_dialog(service_name)).pack(
+            side='right', padx=(self._px(14), self._px(2)))
+
+        # Start, or Stop + Restart (Run / Cancel for a task), in one fixed slot.
+        run = ttk.Frame(header)
+        run.pack(side='right')
         if is_task:
-            run_button = ttk.Button(actions, text="Run", style="Accent.TButton",
+            run_button = ttk.Button(run, text="Run", style="Accent.TButton", width=8,
                                     command=lambda: self._do_run_task(service_name))
-            run_button.pack(side=tk.LEFT, padx=(0, self._px(8)))
-            cancel_button = ttk.Button(actions, text="Cancel", state="disabled",
+            cancel_button = ttk.Button(run, text="Cancel", width=8,
                                        command=lambda: self.service_manager.stop_task(
                                            service_name, self.append_output))
-            cancel_button.pack(side=tk.LEFT, padx=(0, self._px(8)))
+            run_button.grid(row=0, column=0)
+            cancel_button.grid(row=0, column=1)
             controls.update({"run_button": run_button, "cancel_button": cancel_button})
-        elif not self._is_logview(service_name):
-            start_button = ttk.Button(actions, text="Start", style="Accent.TButton",
+        elif not is_logview:
+            start_button = ttk.Button(run, text="Start", style="Accent.TButton", width=8,
                                       command=lambda: self._do_start(service_name))
-            start_button.pack(side=tk.LEFT, padx=(0, self._px(8)))
-
-            stop_button = ttk.Button(actions, text="Stop",
+            stop_button = ttk.Button(run, text="Stop", width=8,
                                      command=lambda: self._do_stop(service_name))
-            stop_button.pack(side=tk.LEFT, padx=(0, self._px(8)))
-
-            restart_button = ttk.Button(actions, text="Restart",
+            restart_button = ttk.Button(run, text="Restart", width=8,
                                         command=lambda: self._do_restart(service_name))
-            restart_button.pack(side=tk.LEFT, padx=(0, self._px(8)))
+            start_button.grid(row=0, column=0)
+            stop_button.grid(row=0, column=1)
+            restart_button.grid(row=0, column=2, padx=(self._px(8), 0))
+            controls.update({"start_button": start_button, "stop_button": stop_button,
+                             "restart_button": restart_button})
 
-            controls.update({
-                "start_button": start_button,
-                "stop_button": stop_button,
-                "restart_button": restart_button,
-            })
-
-        clear_log_button = ttk.Button(
-            actions, text="Clear Log",
-            command=lambda: self.service_manager.clear_log(service_name, self.service_tabs))
-        clear_log_button.pack(side=tk.LEFT)
-
-        # Config actions sit at the far end, away from the run controls, so Remove can't be
-        # hit while reaching for Restart.
-        ttk.Button(actions, text="Remove",
-                   command=lambda: self.remove_service(service_name)).pack(side=tk.RIGHT)
-        ttk.Button(actions, text="Edit",
-                   command=lambda: self.edit_service_dialog(service_name)).pack(
-                       side=tk.RIGHT, padx=(0, self._px(8)))
+        # --- What it runs, in one quiet line; changing it is what Edit is for ---
+        what = ttk.Frame(container)
+        what.pack(fill='x', anchor='w', pady=(self._px(8), self._px(12)))
+        what.columnconfigure(1, weight=1)
+        for row, (label, value, mono) in enumerate(self._describe_service(service_name)):
+            ttk.Label(what, text=label, style="Faint.TLabel").grid(
+                row=row, column=0, sticky='nw', padx=(0, self._px(12)), pady=(0, self._px(2)))
+            cell = ttk.Label(what, text=value, style="Mono.TLabel" if mono else "Subtitle.TLabel",
+                             justify="left")
+            cell.grid(row=row, column=1, sticky='w', pady=(0, self._px(2)))
+            cell.bind("<Configure>", lambda e, c=cell: c.configure(wraplength=max(e.width, 200)))
+        if sm.is_shared(service_name):
+            others = ", ".join(sm.app_by_id[a].get("name", a) for a in sm.apps_of(service_name))
+            rule = SHARED_RULE_COLOR
+            ttk.Label(container, text=f"Shared by {others}", style="Faint.TLabel").pack(
+                anchor='w', pady=(0, self._px(8)))
+        else:
+            rule = self._app_color((sm.primary_app(service_name) or {}).get("id"))
+        self._page_rule(container, rule)
 
         # --- Redis "Lists" card (e.g. for Memurai): see / delete / empty lists ---
         if service_info.get("redis"):
             self._build_redis_panel(container, service_name)
 
-        # --- Output card ---
-        out_card = ttk.Frame(container, style="Card.TFrame", padding=self._px(16))
+        # --- Output: the reason you opened the page, so it gets the rest of it ---
+        out_card = ttk.Frame(container, style="Card.TFrame", padding=(self._px(16), self._px(12)))
         out_card.pack(fill='both', expand=True)
-        ttk.Label(out_card, text="Output", style="Section.TLabel").pack(anchor='w', pady=(0, self._px(8)))
+        out_head = ttk.Frame(out_card)
+        out_head.pack(fill='x', pady=(0, self._px(8)))
+        ttk.Label(out_head, text="Output", style="Section.TLabel").pack(side='left')
         output_area = self._make_log(out_card, height=16)
+        self._add_log_tools(out_head, output_area, service_name,
+                            lambda: self.service_manager.clear_log(service_name, self.service_tabs))
 
         # An interactive task (createsuperuser, makemigrations questions) needs a way to
         # answer prompts, since there's no console attached to the child process.
@@ -1428,20 +1708,32 @@ class UIManager:
             reply = ttk.Frame(out_card)
             reply.pack(fill='x', pady=(self._px(10), 0))
             ttk.Label(reply, text="Reply").pack(side=tk.LEFT, padx=(0, self._px(8)))
-            input_entry = ttk.Entry(reply)
+            input_entry = ttk.Entry(reply, font=(MONO_FONT, 10))
             input_entry.pack(side=tk.LEFT, fill='x', expand=True, padx=(0, self._px(8)))
             input_entry.bind("<Return>", lambda e: self._send_task_input(service_name))
             ttk.Button(reply, text="Send",
                        command=lambda: self._send_task_input(service_name)).pack(side=tk.LEFT)
             controls["input_entry"] = input_entry
 
-        controls.update({
-            "clear_log_button": clear_log_button,
-            "output_area": output_area,
-        })
-        if status_pill is not None:
-            controls["status_pill"] = status_pill
+        controls["output_area"] = output_area
         self.service_tabs[service_name].update(controls)
+
+    def _describe_service(self, name):
+        """(label, value, is_code) rows saying what a service runs, ${tokens} expanded."""
+        sm = self.service_manager
+        info = sm.services[name]
+        kind = service_type_of(info)
+        if kind in ("process", "task"):
+            rows = [("Runs", " ".join(sm.resolve(name, "command", [])), True)]
+            directory = sm.resolve(name, "dir", "")
+            return rows + [("In", directory, True)] if directory else rows
+        if kind == "cron":
+            return [("Calls", info.get("url", ""), True),
+                    ("Every", f"{info.get('interval', 60)} seconds", False)]
+        if kind == "winservice":
+            return [("Service", info.get("service_name", ""), True),
+                    ("Note", "Starting and stopping it asks for administrator rights.", False)]
+        return [("Tails", sm.resolve(name, "log_file", ""), True)]
 
     # ------------------------------------------------- adding/removing services
 
@@ -1476,10 +1768,18 @@ class UIManager:
 
     def remove_service(self, name):
         """Delete a service after confirming — stopping it first if it's still running."""
-        sm = self.service_manager
-        if name not in sm.services:
+        if name not in self.service_manager.services:
             return
+        if not messagebox.askyesno("Remove service",
+                                   f"Remove '{name}' from the configuration?"
+                                   f"{self._removal_detail(name)}",
+                                   parent=self.root):
+            return
+        self.remove_service_now(name)
 
+    def _removal_detail(self, name):
+        """What else removing a service does, for the confirmation."""
+        sm = self.service_manager
         detail = ""
         if sm.is_shared(name):
             others = ", ".join(sm.app_by_id[a].get("name", a) for a in sm.apps_of(name))
@@ -1489,16 +1789,29 @@ class UIManager:
         if sm.is_winservice(name):
             detail += ("\n\nThe Windows service itself is left alone — only this app's entry "
                        "for it is removed.")
+        return detail
 
-        if not messagebox.askyesno("Remove service",
-                                   f"Remove '{name}' from the configuration?{detail}",
-                                   parent=self.root):
-            return
-
+    def remove_service_now(self, name):
+        """Remove a service without asking (the caller has confirmed)."""
         self._drop_service_page(name)
-        sm.remove_service(name)
+        self.service_manager.remove_service(name)
         self._after_services_changed(show=page_key("home", self.current_app))
         self.home_log(f"Removed service '{name}'.")
+
+    def ask_to_remove(self, name, requester, on_answer):
+        """Ask in the window whether `requester` (e.g. Claude Code) may remove a service.
+
+        Doesn't block: on_answer(True/False) is called once the user picks, and the returned
+        dialog can be closed by the caller (counts as No) if nobody answers in time. The
+        window is brought forward first, since it may be minimised to the tray."""
+        if self.tray_manager is not None and not self.root.winfo_viewable():
+            self.tray_manager.restore_window()
+        self.root.deiconify()
+        self.root.lift()
+        return ConfirmDialog(
+            self, "Remove service",
+            f"{requester} wants to remove '{name}' from the configuration.",
+            self._removal_detail(name).strip(), confirm="Remove", on_answer=on_answer)
 
     def restore_default_services(self):
         """Re-add anything shipped by default that isn't in the config any more.
@@ -1779,7 +2092,7 @@ class UIManager:
         box.columnconfigure(1, weight=1)
 
         for i, (name, value) in enumerate(self.service_manager.paths.items()):
-            ttk.Label(box, text="${%s}" % name, font=("Consolas", 9)).grid(
+            ttk.Label(box, text="${%s}" % name, font=(MONO_FONT, 9)).grid(
                 row=i, column=0, sticky='w', padx=(0, self._px(12)), pady=self._px(3))
 
             var = tk.StringVar(value=value)
@@ -2116,7 +2429,7 @@ class UIManager:
         text = tk.Text(frame, wrap="none", height=height,
                        bg=LOG_BG, fg=LOG_FG, insertbackground=LOG_INSERT,
                        selectbackground=LOG_SELECT_BG, relief="flat", borderwidth=0,
-                       highlightthickness=0, font=LOG_FONT,
+                       highlightthickness=0, font=(MONO_FONT, 10),
                        padx=self._px(12), pady=self._px(10), undo=True)
         text.tag_configure("jsonerr", background="#5a1d1d")
 
@@ -2402,14 +2715,26 @@ class UIManager:
     # ----------------------------------------------------------- log helpers
 
     def append_output(self, service_name, text):
-        # Output arrives on background threads; Tkinter is not thread-safe, so marshal
-        # the actual widget update onto the main thread via after().
-        self.root.after(0, self._append_output, service_name, text)
+        # Output arrives on background threads; Tkinter is not thread-safe, so queue it and
+        # let the main thread draw whatever has piled up every LOG_FLUSH_MS.
+        self.log_buffer.append(service_name, text)
+        self.pending_output.append((service_name, text))  # deque.append is thread-safe
+        if not self.output_flush_scheduled:
+            self.output_flush_scheduled = True
+            self.root.after(LOG_FLUSH_MS, self._flush_output)
 
-    def _append_output(self, service_name, text):
-        output_area = self.service_tabs.get(service_name, {}).get("output_area")
-        if output_area is not None:
-            self._append_log(output_area, text)
+    def _flush_output(self):
+        # Cleared before draining: a line queued mid-drain either gets drained here or
+        # schedules the next flush itself, so nothing is left sitting in the queue.
+        self.output_flush_scheduled = False
+        batches = {}
+        while self.pending_output:
+            service_name, text = self.pending_output.popleft()
+            batches.setdefault(service_name, []).append(text)
+        for service_name, entries in batches.items():
+            output_area = self.service_tabs.get(service_name, {}).get("output_area")
+            if output_area is not None:
+                self._append_lines(output_area, entries)
 
     def save_config(self):
         self.service_manager.save()
@@ -2417,6 +2742,7 @@ class UIManager:
     def home_log(self, message, app_id=None):
         # Mirror bulk-action progress to the app's activity log (main-thread safe).
         app_id = app_id or self.current_app
+        self.log_buffer.append(f"activity:{app_id}", message)
         if self.home_logs.get(app_id) is not None:
             self.root.after(0, self._home_log, app_id, message)
 
@@ -2495,6 +2821,12 @@ class UIManager:
 
 # --------------------------------------------------------------------- dialogs
 
+def service_kind_label(info):
+    """What a service is, in the words the sidebar sections use."""
+    return {"process": "Process", "cron": "URL poll", "winservice": "Windows service",
+            "logview": "Log", "task": "Task"}[service_type_of(info)]
+
+
 def service_type_of(info):
     """Which editor type an existing service definition corresponds to.
 
@@ -2531,6 +2863,54 @@ class ModalDialog(tk.Toplevel):
         apply_dark_titlebar(self)
         self.grab_set()
         self.focus_force()
+
+
+class ConfirmDialog(ModalDialog):
+    """A yes/no question that doesn't block the caller, unlike messagebox.
+
+    Used when something outside the window (the control API) asks for a change the user
+    has to approve: the answer arrives through on_answer, and closing the dialog any other
+    way (Escape, the title-bar X, or the caller giving up and calling close()) means No.
+    Kept on top until answered, since the request didn't come from a click in this window."""
+
+    def __init__(self, ui, title, question, detail, confirm, on_answer):
+        super().__init__(ui, title)
+        self.on_answer = on_answer
+        self.answered = False
+        self.attributes("-topmost", True)
+        self.protocol("WM_DELETE_WINDOW", lambda: self._answer(False))
+        self.bind("<Escape>", lambda e: self._answer(False))
+
+        body = ttk.Frame(self, padding=(self._p(22), self._p(18)))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=question, style="Section.TLabel",
+                  wraplength=self._p(420)).pack(anchor="w")
+        if detail:
+            ttk.Label(body, text=detail, style="Subtitle.TLabel", justify="left",
+                      wraplength=self._p(420)).pack(anchor="w", pady=(self._p(8), 0))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x", pady=(self._p(18), 0))
+        # The safe answer is the default: Enter keeps the service, a deliberate click removes.
+        keep = ttk.Button(buttons, text="Keep", style="Accent.TButton",
+                          command=lambda: self._answer(False))
+        keep.pack(side="right")
+        ttk.Button(buttons, text=confirm, command=lambda: self._answer(True)).pack(
+            side="right", padx=(0, self._p(8)))
+        self.bind("<Return>", lambda e: self._answer(False))
+        self.present()
+        keep.focus_set()
+
+    def _answer(self, value):
+        if self.answered:
+            return
+        self.answered = True
+        self.destroy()
+        self.on_answer(value)
+
+    def close(self):
+        """Withdraw the question unanswered (counts as No)."""
+        self._answer(False)
 
 
 class ServiceDialog(ModalDialog):
@@ -2750,20 +3130,13 @@ class ServiceDialog(ModalDialog):
         self.destroy()
 
     def _collect(self):
-        """Validate the form and return (name, service definition). Raises ValueError."""
+        """Read the form and return (name, service definition). Raises ValueError.
+
+        The form only turns its fields into a definition; the rules every definition must
+        meet live in config_manager.validate_service, shared with the control API."""
         sm = self.ui.service_manager
         name = self.vars["name"].get().strip()
-        if not name:
-            raise ValueError("Give the service a name.")
-        if name.startswith("@"):
-            # Service names double as page ids, and '@' is what marks the built-in pages.
-            raise ValueError("A service name can't start with '@'.")
-        if name != self.original_name and name in sm.services:
-            raise ValueError(f"A service called '{name}' already exists.")
-
         apps = [app_id for app_id, var in self.app_vars.items() if var.get()]
-        if not apps:
-            raise ValueError("Pick at least one project for this service.")
 
         kind = self._type_key()
         # Start from whatever the entry already had that this form doesn't manage, so a
@@ -2771,13 +3144,11 @@ class ServiceDialog(ModalDialog):
         info = {key: value for key, value in self.original_info.items()
                 if key not in EDITOR_KEYS}
         info["app"] = apps[0] if len(apps) == 1 else apps
+        info["type"] = kind
 
         if kind in ("process", "task"):
-            command = self.vars["command"].get().split()
-            if not command:
-                raise ValueError("Enter the command to run.")
             info["dir"] = self.vars["dir"].get().strip()
-            info["command"] = command
+            info["command"] = self.vars["command"].get().split()
 
         if kind == "task":
             info["type"] = "task"
@@ -2826,7 +3197,8 @@ class ServiceDialog(ModalDialog):
                 info["include_in_start_all"] = start_all
             info["autostart"] = bool(self.flags["autostart"].get())
 
-        return name, info
+        return config_manager.validate_service(name, info, sm.services, sm.app_id_list,
+                                               self.original_name)
 
     def _redis_block(self):
         host = self.vars["redis_host"].get().strip()

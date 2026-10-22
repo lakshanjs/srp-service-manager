@@ -8,6 +8,7 @@ import threading
 import requests
 import urllib3
 import config_manager as config
+from winapi import list_processes, service_status, service_binary_path
 
 # Cron services poll local *.test URLs over self-signed TLS; silence the warning spam.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -41,6 +42,29 @@ def run_elevated_cmd(cmd):
         return False
 
 
+def same_path(a, b):
+    return bool(a and b) and os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def split_cmdline(cmdline):
+    """Split a Windows command line exactly as the child process itself would."""
+    argc = ctypes.c_int()
+    shell32 = ctypes.windll.shell32
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = shell32.CommandLineToArgvW(cmdline, ctypes.byref(argc))
+    if not argv:
+        return []
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
+
+
+def taskkill_cmd(pids):
+    """One `taskkill` for several process trees, e.g. a stray mysqld and its child."""
+    return "taskkill /F /T " + " ".join(f"/PID {p}" for p in pids)
+
+
 class ServiceManager:
     def __init__(self):
         data = config.load_config()
@@ -53,9 +77,14 @@ class ServiceManager:
         self.app_by_id = {a["id"]: a for a in self.apps}
 
         self.processes = {}
+        self.starting = set()     # child processes between Start and their launch (stray scan)
+        self.started_at = {}      # child processes: name -> time.time() they launched (uptime)
+        self.exit_codes = {}      # child processes that exited on their own: name -> exit code
         self.stop_flags = {}      # cron services: name -> threading.Event
         self.task_procs = {}      # one-shot tasks: name -> Popen (or None once finished)
+        self.task_exit_codes = {}  # one-shot tasks: name -> exit code of the last run
         self.winservice_status = {}  # name -> state string for "winservice"-type entries
+        self.winservice_pids = {}    # name -> pid of a running Windows service
         self.log_tails = {}       # name -> threading.Event that stops its tail thread
         self._start_winservice_poller()  # keep OS-service status dots current in the background
 
@@ -311,6 +340,9 @@ class ServiceManager:
         if service_name in self.processes and self.processes[service_name]:
             append_output(service_name, "Service is already running.")
             return
+        if service_name in self.starting:
+            append_output(service_name, "Service is already starting.")
+            return
 
         if "command" in service_info:
             tab = service_tabs.get(service_name, {})
@@ -326,6 +358,7 @@ class ServiceManager:
 
             service_info["dir"] = directory
             scope = self.scope_for(service_name)
+            self.starting.add(service_name)
             threading.Thread(
                 target=self.run_service,
                 args=(service_name,
@@ -338,12 +371,14 @@ class ServiceManager:
         elif "url" in service_info:
             # Start a cron-like service (polling a URL)
             tab = service_tabs.get(service_name, {})
-            url = tab["url_entry"].get()
+            url_entry, interval_entry = tab.get("url_entry"), tab.get("interval_entry")
+            url = url_entry.get() if url_entry is not None else service_info["url"]
             try:
-                interval = int(tab["interval_entry"].get())
+                interval = int(interval_entry.get() if interval_entry is not None
+                               else service_info.get("interval", 60))
                 if interval <= 0:
                     raise ValueError
-            except (KeyError, ValueError):
+            except (TypeError, ValueError):
                 append_output(service_name, "Invalid interval: enter a positive whole number of seconds.")
                 return
             service_info["url"] = url
@@ -366,6 +401,7 @@ class ServiceManager:
             # directory (e.g. centrifugo.exe, memcached.exe), find it there first; otherwise
             # fall back to PATH (e.g. php, java, ngrok). shutil.which adds .exe automatically.
             resolved = self._resolve_command(command, service_dir)
+            self._kill_stray_copies(service_name, resolved, append_output)
 
             # Launch in the service's own directory via cwd= rather than os.chdir(),
             # which changes the working directory for the entire process and races with
@@ -382,6 +418,8 @@ class ServiceManager:
             )
 
             self.processes[service_name] = process
+            self.started_at[service_name] = time.time()
+            self.exit_codes.pop(service_name, None)
             append_output(service_name, "Service started.")
 
             def read_output(pipe):
@@ -401,6 +439,28 @@ class ServiceManager:
             )
         except Exception as e:
             append_output(service_name, f"Error starting service: {e}")
+        finally:
+            self.starting.discard(service_name)
+
+    def _kill_stray_copies(self, service_name, resolved, append_output):
+        """Kill leftover copies of this exact command, e.g. from a crashed or force-closed
+        earlier session, which would otherwise hold its port or lock its files.
+
+        The arguments must match as well as the executable: php.exe or java.exe are shared by
+        several services, and only a copy of *this* one is a stray."""
+        ours = {p.pid for p in self.processes.values() if isinstance(p, subprocess.Popen)}
+        strays = [p["pid"] for p in list_processes(resolved[0])
+                  if p["pid"] not in ours
+                  and same_path(p["exe"], resolved[0])
+                  and split_cmdline(p["cmdline"])[1:] == list(resolved[1:])]
+        if not strays:
+            return
+        append_output(service_name, f"Killing leftover process(es) of this service: PID {', '.join(map(str, strays))}")
+        result = subprocess.run(taskkill_cmd(strays), capture_output=True, text=True,
+                                creationflags=CREATE_NO_WINDOW)
+        if result.returncode != 0:
+            append_output(service_name, (result.stderr or result.stdout).strip()
+                          or f"taskkill failed (exit code {result.returncode}).")
 
     def _resolve_command(self, command, service_dir):
         """Absolute-path the executable, looking in the service dir before PATH."""
@@ -467,6 +527,7 @@ class ServiceManager:
             return
 
         def worker():
+            self.task_exit_codes.pop(name, None)
             try:
                 resolved = self._resolve_command(command, cwd)
                 append_output(name, f"$ {' '.join(resolved)}")
@@ -484,6 +545,7 @@ class ServiceManager:
                 self.task_procs[name] = process
                 self._stream_task_output(process.stdout, lambda line: append_output(name, line))
                 code = process.wait()
+                self.task_exit_codes[name] = code
                 append_output(name, f"— finished (exit code {code}) —")
                 if on_done:
                     on_done(code)
@@ -582,6 +644,8 @@ class ServiceManager:
                 )
 
             self.processes[service_name] = None
+            self.started_at.pop(service_name, None)
+            self.exit_codes.pop(service_name, None)  # stopped on purpose: not a crash
             append_output(service_name, "Service stopped")
             return True
 
@@ -618,7 +682,11 @@ class ServiceManager:
         if hasattr(proc, "poll"):  # subprocess.Popen
             if proc.poll() is None:
                 return True
-            self.processes[name] = None  # exited on its own; let Start work again
+            # Exited on its own; let Start work again, and remember how it ended so the UI
+            # can tell a crash apart from a service someone stopped.
+            self.exit_codes[name] = proc.returncode
+            self.started_at.pop(name, None)
+            self.processes[name] = None
             return False
         return True  # cron sentinel (True)
 
@@ -697,22 +765,18 @@ class ServiceManager:
         """Query a Windows service's state without needing admin. Returns one of
         'running' | 'stopped' | 'pending' | 'not_found' | 'unknown'."""
         try:
-            result = subprocess.run(
-                ["sc", "query", service_name],
-                capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
-            )
+            return service_status(service_name)[0]
         except Exception:
             return "unknown"
-        if result.returncode == 1060:  # ERROR_SERVICE_DOES_NOT_EXIST
-            return "not_found"
-        out = (result.stdout or "").upper()
-        if "RUNNING" in out:
-            return "running"
-        if "STOPPED" in out:
-            return "stopped"
-        if "PENDING" in out:  # START_PENDING / STOP_PENDING — mid-transition
-            return "pending"
-        return "not_found" if result.returncode != 0 else "unknown"
+
+    def _query_winservice(self, name, svc):
+        if not svc:
+            self.winservice_status[name], self.winservice_pids[name] = "not_found", 0
+            return
+        try:
+            self.winservice_status[name], self.winservice_pids[name] = service_status(svc)
+        except Exception:
+            self.winservice_status[name], self.winservice_pids[name] = "unknown", 0
 
     def is_winservice_running(self, name):
         return self.winservice_status.get(name) == "running"
@@ -729,7 +793,7 @@ class ServiceManager:
                     if info.get("type") != "winservice":
                         continue
                     svc = (info.get("service_name") or "").strip()
-                    self.winservice_status[name] = self._sc_query_state(svc) if svc else "not_found"
+                    self._query_winservice(name, svc)
                 time.sleep(3)
 
         threading.Thread(target=poll, daemon=True).start()
@@ -744,7 +808,7 @@ class ServiceManager:
 
         def work():
             svc = (self.services.get(name, {}).get("service_name") or "").strip()
-            self.winservice_status[name] = self._sc_query_state(svc) if svc else "not_found"
+            self._query_winservice(name, svc)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -771,14 +835,67 @@ class ServiceManager:
         verb = {"start": "Starting", "stop": "Stopping", "restart": "Restarting"}[action]
         append_output(service_name, f"{verb} Windows service '{svc}'...")
 
-        if is_admin():
-            threading.Thread(
-                target=self._run_admin_cmd, args=(service_name, cmd, append_output), daemon=True
-            ).start()
-        elif run_elevated_cmd(cmd):
-            append_output(service_name, "Elevated request sent — accept the UAC prompt. Status will update shortly.")
-        else:
-            append_output(service_name, "Could not elevate (UAC declined or unavailable).")
+        def work(cmd):
+            if action != "stop":
+                cmd = self._with_stray_kill(service_name, svc, cmd, action, append_output)
+            if is_admin():
+                self._run_admin_cmd(service_name, cmd, append_output)
+            elif run_elevated_cmd(cmd):
+                append_output(service_name, "Elevated request sent — accept the UAC prompt. Status will update shortly.")
+            else:
+                append_output(service_name, "Could not elevate (UAC declined or unavailable).")
+
+        # Off the UI thread: the stray lookup queries WMI, which takes a second or so.
+        threading.Thread(target=work, args=(cmd,), daemon=True).start()
+
+    def _with_stray_kill(self, service_name, svc, cmd, action, append_output):
+        """Prefix `net start` with a kill of any process running the service's own executable
+        outside the service, e.g. a mysqld.exe launched by hand or by the WAMP menu against
+        the same data folder. Such a copy holds the service's files (MySQL: "ibdata1 must be
+        writable") or its port, so the service can't start while it runs.
+
+        The kill rides in the same command as `net start`, so it's elevated along with it and
+        costs no extra UAC prompt."""
+        if action == "start" and self._sc_query_state(svc) == "running":
+            return cmd  # already up; `net start` just says so, and there's nothing to clean
+        exe = self._service_binary(svc)
+        if not exe:
+            return cmd
+        # The service's own process (and its children) survive until `net stop` in a restart.
+        own = self._service_pid(svc)
+        procs = list_processes(exe)
+        keep = {own} if own else set()
+        keep |= {p["pid"] for p in procs if own and p["ppid"] == own}
+        strays = [p for p in procs if p["pid"] not in keep and same_path(p["exe"], exe)]
+        # taskkill /T takes the children with it, so only name the roots.
+        stray_pids = {p["pid"] for p in strays}
+        roots = [p["pid"] for p in strays if p["ppid"] not in stray_pids]
+        if not roots:
+            return cmd
+        append_output(service_name, f"Killing {len(strays)} stray {os.path.basename(exe)} "
+                                    f"process(es) running outside the service: PID "
+                                    f"{', '.join(str(p['pid']) for p in strays)}")
+        kill = taskkill_cmd(roots)
+        if action == "restart":
+            stop, start = cmd.split(" & ", 1)
+            return f"{stop} & {kill} & {start}"
+        return f"{kill} & {cmd}"
+
+    def _service_binary(self, svc):
+        """The executable a Windows service runs, from its BINARY_PATH_NAME."""
+        value = (service_binary_path(svc) or "").strip()
+        if not value:
+            return None
+        if value.startswith('"'):
+            return value[1:].split('"', 1)[0]
+        # Unquoted: arguments follow the path, e.g. `d:\...\mysqld.exe wampmysqld64`.
+        m = re.match(r"(.+?\.exe)\b", value, re.IGNORECASE)
+        return m.group(1) if m else value.split()[0]
+
+    def _service_pid(self, svc):
+        """PID of a running Windows service's process, or None."""
+        state, pid = service_status(svc)
+        return pid if state == "running" and pid else None
 
     def start_log_tail(self, name, append_output):
         """Begin streaming a service's log file into its output area (best-effort).

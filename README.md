@@ -30,8 +30,10 @@ IPC, so both stacks live in one app that tracks them together.
   dashboard follow.
 - **Shared services** appear in *both* apps' sidebars, tagged `shared`. **Stop All** in one
   app leaves them running while the other app still has its own services up.
-- Per-app **Dashboard** with scoped Start All / Restart All / Stop All, a live services
-  table, and an activity log.
+- Per-app **Dashboard**: one row per service with a status lamp, its state (running, with
+  pid and uptime; stopped; *crashed, exit N* when it died on its own), its own Start / Stop /
+  Restart, and the Start all / Auto-start toggles. Scoped Start all / Restart all / Stop all,
+  and an activity log.
 - **Add, edit and remove services** from the UI — no hand-editing needed for day-to-day
   changes. Projects can be added and edited the same way.
 - **Settings page** for path roots, startup/close behaviour, window size, project management,
@@ -43,7 +45,9 @@ IPC, so both stacks live in one app that tracks them together.
 - **Virtualenv-aware** commands via `${python}` / `${project_dir}` tokens.
 - Service types: child processes, Windows services (via the SCM, with UAC), URL-polling cron
   tasks, log-only viewers, and one-shot tasks.
-- Live **status dots**, log tailing with rotation handling, a **Redis Lists** panel for
+- **Logs** keep the last 5000 lines, with **Find** (Ctrl+F; Enter / Shift+Enter to step) and
+  **Jump to latest** once you've scrolled up to read something.
+- Live **status lamps** in the sidebar, log tailing with rotation handling, a **Redis Lists** panel for
   Memurai, per-app **front-end build** pages, and minimise-to-tray with per-app submenus.
 
 ## Managing services
@@ -77,6 +81,45 @@ things worth knowing:
 ```bash
 pip install -r requirements.txt
 ```
+
+## Claude Code / scripting control
+
+The running app serves a small control API on `127.0.0.1` so Claude Code works against the
+same processes and log lines you're watching, instead of launching its own copies of the
+servers. Everything goes through the UI's own handlers, so the window shows each action as if
+it had been clicked.
+
+| Piece | What |
+|---|---|
+| `control_api.py` | The API inside the app. Port `47615` (falls back to a free one), bearer token; both are written to `%APPDATA%\OnCodes\control.json` on launch and the file is removed on exit. Keeps the last 2000 lines of every log, numbered with a cursor. |
+| `mcp_server.py` | MCP server for Claude Code: `service_status`, `service_logs`, `app_activity`, `start/stop/restart_service`, `run_task`, `task_input`, `stop_task`, `start_all/stop_all/restart_all`, and for the configuration `get_service_config`, `add_service`, `update_service`, `remove_service`. Stdlib only. |
+| `smctl.py` | The same from a shell: `python smctl.py status`, `logs NAME --since N -f`, `restart NAME --wait 5`, `run-task migrate --wait 10`, `input NAME TEXT`, `stop-all neo`, `config NAME`, `add NAME JSON`, `update NAME JSON [--rename NEW]`, `remove NAME`, … Add `--json` for the raw response. |
+
+Register the MCP server once for every project:
+
+```bash
+claude mcp add --scope user service-manager -- python D:\path\to\mcp_server.py
+```
+
+and tell Claude to use it (e.g. in `~/.claude/CLAUDE.md`) rather than running servers itself.
+
+Notes:
+
+- Service names match exactly, case-insensitively, or by a unique part (`centrifugo` is
+  ambiguous between SRP and NEO; `neo centrifugo` isn't).
+- `wait` (seconds, max 60) holds the reply so it carries the output the action produced.
+  Every action also returns `cursor_before`; read the log `since` it to follow up.
+- Restart on a stopped service starts it. Stop/restart issued while a start is still in its
+  stray-process scan wait for the launch, so the stop isn't lost.
+- Windows services still need you to accept the UAC prompt.
+- Adding and editing go through the same checks as the service editor. `update_service`
+  merges its `changes` into the definition, and a `null` value deletes a key. A running
+  service keeps its old definition until restarted; renaming one stops it.
+- **Removing always asks you first**: a dialog opens in the window (brought out of the
+  tray if need be) and the request waits for your answer. Keep is the default, and if
+  nobody answers within the timeout (120 s) the question is withdrawn and nothing is
+  removed.
+- Turn it off with `"control_api": {"enabled": false}` in `appsettings.json`.
 
 ## Building the executable
 

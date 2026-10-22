@@ -362,6 +362,141 @@ def is_shared(info, all_app_ids):
     return len(app_ids(info, all_app_ids)) > 1
 
 
+# ------------------------------------------------------------ service schema
+
+SERVICE_KINDS = ("process", "cron", "winservice", "logview", "task")
+
+# The fields each kind of service uses. A kind's own fields are kept; another kind's are
+# dropped, so switching a process to a URL poll can't leave a stale `command` behind (start
+# looks for `command` first). Keys no kind uses, e.g. added by hand, are always kept.
+KIND_FIELDS = {
+    "process": {"dir", "command", "log_file", "redis", "include_in_start_all", "autostart"},
+    "task": {"dir", "command", "section", "interactive"},
+    "cron": {"url", "interval", "include_in_start_all", "autostart"},
+    "winservice": {"service_name", "log_file", "redis", "include_in_start_all", "autostart"},
+    "logview": {"log_file"},
+}
+SCHEMA_FIELDS = set().union(*KIND_FIELDS.values()) | {"app", "type"}
+
+
+def service_kind(info):
+    """A definition's kind. A plain process is the absence of a `type`, except a legacy
+    entry that only carries a `url`, which is a URL poll."""
+    kind = info.get("type")
+    if kind in SERVICE_KINDS:
+        return kind
+    return "cron" if "url" in info else "process"
+
+
+def validate_service(name, info, existing, all_app_ids, original_name=None):
+    """Check a service definition and return (name, cleaned copy); raise ValueError saying
+    what to fix. The service editor and the control API both go through this, so neither
+    can write an entry the other would refuse.
+
+    `existing` is the current services mapping; `original_name` is the entry being edited
+    (None when adding), so it doesn't count as a clash with itself."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Give the service a name.")
+    if name.startswith("@"):
+        # Service names double as page ids, and '@' is what marks the built-in pages.
+        raise ValueError("A service name can't start with '@'.")
+    if name != original_name and name in existing:
+        raise ValueError(f"A service called '{name}' already exists.")
+
+    if not isinstance(info, dict):
+        raise ValueError("The definition must be an object.")
+    kind = info.get("type") or service_kind(info)
+    if kind not in SERVICE_KINDS:
+        raise ValueError(f"Unknown type '{kind}'. Use one of: {', '.join(SERVICE_KINDS)}.")
+
+    apps = info.get("app")
+    apps = [apps] if isinstance(apps, str) else list(apps or [])
+    if not apps:
+        raise ValueError("Pick at least one project for this service.")
+    unknown = [str(a) for a in apps if a not in all_app_ids]
+    if unknown:
+        raise ValueError(f"Unknown project(s): {', '.join(unknown)}. "
+                         f"Known: {', '.join(all_app_ids)}.")
+
+    allowed = KIND_FIELDS[kind]
+    clean = {k: v for k, v in info.items()
+             if k not in SCHEMA_FIELDS or k in allowed}  # hand-added keys survive
+    clean["app"] = apps[0] if len(apps) == 1 else apps
+    if kind == "process":
+        clean.pop("type", None)
+    else:
+        clean["type"] = kind
+
+    def text(key, required=None):
+        value = clean.get(key)
+        if value is None or value == "":
+            if required:
+                raise ValueError(required)
+            clean.pop(key, None)
+            return
+        if not isinstance(value, str):
+            raise ValueError(f"'{key}' must be text.")
+        clean[key] = value.strip()
+
+    if kind in ("process", "task"):
+        command = clean.get("command")
+        if isinstance(command, str):
+            command = command.split()
+        if (not isinstance(command, list) or not command
+                or not all(isinstance(part, str) and part for part in command)):
+            raise ValueError("Enter the command to run (a list of arguments, or one line).")
+        clean["command"] = command
+        text("dir")
+        clean.setdefault("dir", "")
+    if kind == "task":
+        text("section")
+        if clean.get("interactive") is not None and not isinstance(clean["interactive"], bool):
+            raise ValueError("'interactive' must be true or false.")
+        if not clean.get("interactive"):
+            clean.pop("interactive", None)
+    elif kind == "cron":
+        text("url", "Enter the URL to call.")
+        interval = clean.get("interval", 60)
+        if isinstance(interval, str) and interval.strip().isdigit():
+            interval = int(interval)
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
+            raise ValueError("The interval must be a positive whole number of seconds.")
+        clean["interval"] = interval
+    elif kind == "winservice":
+        text("service_name", "Enter the Windows service name, as shown in services.msc.")
+    elif kind == "logview":
+        text("log_file", "Point the log viewer at a file.")
+    if kind in ("process", "winservice"):
+        text("log_file")
+        redis = clean.get("redis")
+        if redis in (None, {}):
+            clean.pop("redis", None)
+        else:
+            if not isinstance(redis, dict) or not str(redis.get("host") or "").strip():
+                raise ValueError("Enter a Redis host, or drop 'redis' to remove the Lists panel.")
+            try:
+                port = int(redis.get("port") or 6379)
+            except (TypeError, ValueError):
+                raise ValueError("The Redis port must be a whole number.")
+            clean["redis"] = {**redis, "host": str(redis["host"]).strip(), "port": port}
+
+    if kind in ("process", "cron", "winservice"):
+        start_all = clean.get("include_in_start_all", False)
+        # A shared service can carry a per-project object: {"srp": true, "neo": false}.
+        if isinstance(start_all, dict):
+            if not all(a in all_app_ids and isinstance(v, bool) for a, v in start_all.items()):
+                raise ValueError("'include_in_start_all' maps project ids to true/false.")
+        elif not isinstance(start_all, bool):
+            raise ValueError("'include_in_start_all' must be true/false, or per project.")
+        clean["include_in_start_all"] = start_all
+        if not isinstance(clean.get("autostart", False), bool):
+            raise ValueError("'autostart' must be true or false.")
+        clean["autostart"] = clean.get("autostart", False)
+
+    return name, clean
+
+
 # Fields the app defines itself on a project. Every *other* scalar key on an app is a
 # ${token} its services can use, which is what makes this list worth naming in one place.
 APP_RESERVED_KEYS = {"id", "name", "short", "color", "build"}
@@ -412,6 +547,8 @@ DEFAULT_SETTINGS = {
     # Closing behaviour
     "minimize_to_tray_on_close": False,  # [X] hides to the tray instead of exiting
     "confirm_on_exit": False,            # ask before stopping services and quitting
+    # Local control API (127.0.0.1 only, token in control.json) for Claude Code / smctl.
+    "control_api": {"enabled": True, "port": 47615},
 }
 
 

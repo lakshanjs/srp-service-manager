@@ -5,6 +5,7 @@ from service import ServiceManager
 from tray_manager import TrayManager, APP_NAME
 from ui_manager import UIManager, apply_dark_titlebar
 from update import check_for_updates
+from control_api import ControlServer
 
 
 def enable_hidpi():
@@ -61,6 +62,14 @@ if __name__ == "__main__":
     # Apply the modern Sun Valley dark theme
     sv_ttk.set_theme("dark")
     root.configure(background="#1c1c1c")
+    # sv_ttk recolours through a <<ThemeChanged>> handler that calls tk_setPalette, which
+    # stamps an explicit foreground onto every label that exists at the time, silently
+    # overriding each label style's colour (every muted label rendered white). ttk fires
+    # that event again whenever a style is configured, i.e. after the UI is built. So let
+    # run once now, before any widget exists, then drop it: the palette is set, and
+    # nothing switches themes afterwards.
+    root.tk.call("configure_colors")
+    root.unbind_class(root.winfo_class(), "<<ThemeChanged>>")
 
     ui_manager = UIManager(root, service_manager, ui_scale=scale)
     tray_manager = TrayManager(root, service_manager, ui_manager)
@@ -70,6 +79,16 @@ if __name__ == "__main__":
 
     # Set up the tray functionality
     tray_manager.setup_tray()
+
+    # Let Claude Code (via mcp_server.py) and smctl.py drive this instance instead of
+    # starting their own copies of the servers.
+    api_cfg = service_manager.settings.get("control_api", {})
+    if api_cfg.get("enabled", True):
+        control = ControlServer(root, service_manager, ui_manager)
+        port = control.start(int(api_cfg.get("port", 47615)))
+        tray_manager.control_server = control
+        ui_manager.home_log(f"Control API listening on 127.0.0.1:{port}." if port
+                            else "Control API could not start (no free port).")
 
     # Darken the title bar once the window exists
     apply_dark_titlebar(root)

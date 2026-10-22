@@ -228,6 +228,8 @@ class TrayManager:
                                        parent=self.root):
                 return
         self.service_manager.stop_all_services()
+        if getattr(self, "control_server", None):
+            self.control_server.stop()  # removes control.json, so clients see we're gone
         if self.tray_icon:
             self.tray_icon.stop()
         self.root.quit()
