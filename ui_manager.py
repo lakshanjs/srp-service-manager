@@ -40,6 +40,8 @@ LOG_FIND_BG = "#5c4a1a"      # every match of the find box
 LOG_FIND_CURRENT = "#9c7a1c"  # the match the find box is on
 MUTED = "#8e9299"
 FAINT = "#6b6f76"            # captions under the muted text: kinds, pids, uptimes
+SMALL_BUTTON_BG = "#2c2e33"
+SMALL_BUTTON_LINE = "#3a3d43"
 
 # Log syntax colors: dim the bracketed [timestamp]/[pid]/[level] noise so the actual
 # message stands out, and tint warnings/errors so they're scannable at a glance.
@@ -308,7 +310,21 @@ class UIManager:
         style.configure("Accent.TButton", padding=bpad, font=(UI_FONT, 10))
         # Row-level controls on the dashboard: same buttons, sized to sit inside a list row.
         spad = (self._px(10), self._px(3))
-        style.configure("Small.TButton", padding=spad, font=(UI_FONT, 9))
+        # Small buttons are drawn flat, by the parent (clam) theme's border element, instead
+        # of from sv_ttk's bitmaps: a dashboard has dozens of them, and on screen the bitmap
+        # ones took ~4x as long to paint (39 of them: 77 ms vs 20 ms), most of a page switch.
+        # Solid relief so the outline is drawn, which is what shows focus and a press.
+        style.layout("Small.TButton", [("Button.border", {"sticky": "nswe", "border": "1", "children": [
+            ("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]})]})])
+        style.configure("Small.TButton", padding=spad, font=(UI_FONT, 9), relief="solid",
+                        borderwidth=1, background=SMALL_BUTTON_BG, foreground="#e8e6e3",
+                        bordercolor=SMALL_BUTTON_LINE, lightcolor=SMALL_BUTTON_BG,
+                        darkcolor=SMALL_BUTTON_BG)
+        fill = [("disabled", "#232427"), ("pressed", "#1d1e21"), ("active", "#3a3d43")]
+        style.map("Small.TButton", background=fill, lightcolor=fill, darkcolor=fill,
+                  foreground=[("disabled", FAINT), ("pressed", "#b9bcc1")],
+                  bordercolor=[("focus", "#e8e6e3"), ("disabled", "#2b2c30"),
+                               ("pressed", "#55585f"), ("active", "#4a4d54")])
         style.configure("Small.Accent.TButton", padding=spad, font=(UI_FONT, 9))
         style.configure("Title.TLabel", font=(DISPLAY_FONT, 20))
         style.configure("Header.TLabel", font=(DISPLAY_FONT, 17))
