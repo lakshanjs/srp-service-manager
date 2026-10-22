@@ -9,6 +9,7 @@ if __name__ == "__main__" and "--mcp" in sys.argv[1:]:
     sys.exit(0)
 
 import ctypes
+import threading
 import tkinter as tk
 import sv_ttk
 from service import ServiceManager
@@ -16,6 +17,7 @@ from tray_manager import TrayManager, APP_NAME
 from ui_manager import UIManager, apply_dark_titlebar
 from update import check_for_updates
 from control_api import ControlServer
+import claude_setup
 
 
 def enable_hidpi():
@@ -108,6 +110,14 @@ if __name__ == "__main__":
     # dialog about GitHub being unreachable.
     if service_manager.settings.get("check_updates", True):
         check_for_updates(root, service_manager.settings, log=ui_manager.home_log)
+
+    # Keep the MCP server copy Claude Code runs in step with this build (only used when the
+    # .exe is set to run as administrator; see claude_setup). A 38 MB copy, so off-thread.
+    def refresh_mcp_copy():
+        problem = claude_setup.refresh_mcp_copy(only_if_present=True)
+        if problem:
+            ui_manager.home_log(f"Claude Code: {problem}")
+    threading.Thread(target=refresh_mcp_copy, daemon=True).start()
 
     # Straight to the tray, if that's what the settings page says. Deferred so the window
     # is fully mapped first — withdrawing a half-built window leaves it un-restorable.

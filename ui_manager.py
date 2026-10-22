@@ -2698,6 +2698,11 @@ class UIManager:
                       f"'{claude_setup.SERVER_NAME}'.")
         else:
             label, color, detail = "Not installed", MUTED, ""
+        if st["copy"] and st["cli"]:
+            detail = (detail + "\n\n" if detail else "") + (
+                "This app is set to run as administrator, which Claude Code can't launch, so "
+                "a copy of it is registered instead. The app keeps the copy up to date each "
+                "time it starts.")
         self.claude_state.configure(text=label, foreground=color)
         self.claude_detail.configure(text=detail)
         self.claude_install_btn.configure(

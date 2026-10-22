@@ -6,12 +6,20 @@ list` health-checks (i.e. launches) every registered server, which takes seconds
 
 The registered command depends on how the app is running. The packaged .exe serves MCP
 itself (`… .exe --mcp`), so it needs no Python; from source, it's python + mcp_server.py.
-Either way it points at *this* copy, so moving the .exe means installing again."""
+Either way it points at *this* copy, so moving the .exe means installing again.
+
+One exception: an .exe set to "Run as administrator" (a Windows compatibility flag on its
+path) can't be launched by Claude Code, which isn't elevated. Then a copy of the .exe in
+%LOCALAPPDATA%\\OnCodes\\mcp is registered instead, where the flag doesn't apply, and the
+app refreshes that copy each time it starts (refresh_mcp_copy) so it matches the app."""
 
 import os
 import sys
+import glob
 import json
+import time
 import shutil
+import winreg
 import subprocess
 
 SERVER_NAME = "oncodes-service-manager"
@@ -49,10 +57,79 @@ tasks) run in that app, which I watch while you work.
 LEGACY_NOTE_HEADING = "# Dev servers: use OnCodes Dev Service Manager"
 
 
+COMPAT_LAYERS = r"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+MCP_COPY_NAME = "OnCodes Service Manager MCP.exe"
+
+
+def runs_as_admin(path):
+    """True if Windows is set to always run `path` as administrator (Properties ->
+    Compatibility -> "Run this program as an administrator", for this user or all)."""
+    target = os.path.normcase(os.path.abspath(path))
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, COMPAT_LAYERS) as key:
+                i = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(key, i)
+                    except OSError:
+                        break
+                    if (os.path.normcase(name) == target
+                            and "RUNASADMIN" in str(value).upper().split()):
+                        return True
+                    i += 1
+        except OSError:
+            continue
+    return False
+
+
+def mcp_copy_path():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "OnCodes", "mcp", MCP_COPY_NAME)
+
+
+def uses_copy():
+    """Whether this app has to register the copy rather than itself (see the module doc)."""
+    return getattr(sys, "frozen", False) and runs_as_admin(sys.executable)
+
+
+def refresh_mcp_copy(only_if_present=False):
+    """Make the copy match the running .exe, if this app uses one. Install creates it; at
+    startup (only_if_present) an existing copy is brought up to date after a deploy.
+
+    Open Claude Code sessions keep the copy running, and Windows won't overwrite or delete
+    a running .exe, but it will rename one: so the old copy is moved aside first and
+    cleaned up once nothing has it open. Returns an error message, or None."""
+    target = mcp_copy_path()
+    if not uses_copy() or (only_if_present and not os.path.exists(target)):
+        return None
+    try:
+        src = os.stat(sys.executable)
+        try:
+            dst = os.stat(target)
+            if dst.st_size == src.st_size and int(dst.st_mtime) == int(src.st_mtime):
+                return None  # already this build
+        except FileNotFoundError:
+            pass
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if os.path.exists(target):
+            os.replace(target, f"{target}.old-{int(time.time())}")
+        shutil.copy2(sys.executable, target)  # copy2 keeps the mtime the check compares
+    except OSError as e:
+        return f"Couldn't update the MCP copy at {target}: {e}"
+    finally:
+        for old in glob.glob(glob.escape(target) + ".old-*"):
+            try:
+                os.remove(old)
+            except OSError:
+                pass  # still in use by an open session; next start gets it
+    return None
+
+
 def server_command():
     """The command Claude Code should run to start this copy's MCP server."""
     if getattr(sys, "frozen", False):
-        return [sys.executable, "--mcp"]
+        return [mcp_copy_path() if uses_copy() else sys.executable, "--mcp"]
     python = sys.executable
     # pythonw has no stdio to speak MCP over; use the console python beside it.
     console = os.path.join(os.path.dirname(python), "python.exe")
@@ -108,6 +185,7 @@ def status():
             "current": entry is not None and _same_command(_command_of(entry), server_command()),
             "command": server_command(),
             "legacy": [n for n in LEGACY_NAMES if registration(n) is not None],
+            "copy": uses_copy(),
             "note": has_note()}
 
 
@@ -123,6 +201,9 @@ def install():
     cli = find_cli()
     if not cli:
         return False, "Claude Code's `claude` command wasn't found. Install Claude Code first."
+    problem = refresh_mcp_copy()  # the copy has to exist before it's registered
+    if problem:
+        return False, problem
     for name in (SERVER_NAME,) + LEGACY_NAMES:
         if registration(name) is not None:
             _run(cli, "mcp", "remove", name, "--scope", "user")
