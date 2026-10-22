@@ -1,8 +1,10 @@
 """MCP server that gives Claude Code the Service Manager's controls.
 
-Register once, for every project:
+Register once, for every project, from Settings -> Claude Code in the app, or by hand:
 
-    claude mcp add --scope user service-manager -- python D:\\path\\to\\mcp_server.py
+    claude mcp add --scope user oncodes-service-manager -- python D:\\path\\to\\mcp_server.py
+
+The packaged .exe serves the same thing with `--mcp` (see main.py), so it needs no Python.
 
 It speaks MCP over stdio (newline-delimited JSON-RPC) and forwards each tool call to the
 running app's control API through smctl. Standard library only, so it runs on any Python

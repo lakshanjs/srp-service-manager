@@ -15,6 +15,7 @@ import os
 import json
 import time
 import queue
+import socket
 import secrets
 import threading
 from collections import deque
@@ -33,6 +34,22 @@ MAX_CONFIRM_TIMEOUT = 300
 
 def control_file_path():
     return os.path.join(config.config_dir(), CONTROL_FILE_NAME)
+
+
+class ExclusiveHTTPServer(ThreadingHTTPServer):
+    """An HTTP server that owns its port outright.
+
+    http.server sets SO_REUSEADDR, which on Windows lets a *second* process bind a port
+    that is already in use. Then a second instance of the app shares the port with the
+    first and requests land on either one, and any local program could bind it the same
+    way and read the bearer token off incoming requests. SO_EXCLUSIVEADDRUSE refuses both:
+    the bind fails, and start() moves on to a free port."""
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 class LogBuffer:
@@ -100,7 +117,7 @@ class ControlServer:
         handler = self._make_handler()
         for candidate in (port, 0):
             try:
-                self.httpd = ThreadingHTTPServer(("127.0.0.1", candidate), handler)
+                self.httpd = ExclusiveHTTPServer(("127.0.0.1", candidate), handler)
                 break
             except OSError:
                 continue

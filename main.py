@@ -1,3 +1,13 @@
+import sys
+
+# `--mcp`: be Claude Code's MCP server (stdio) instead of opening the window, so the packaged
+# .exe can be registered with Claude Code without a Python install. Checked before the GUI
+# imports, which a server Claude starts for every session has no use for.
+if __name__ == "__main__" and "--mcp" in sys.argv[1:]:
+    import mcp_server
+    mcp_server.main()
+    sys.exit(0)
+
 import ctypes
 import tkinter as tk
 import sv_ttk

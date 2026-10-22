@@ -95,13 +95,21 @@ it had been clicked.
 | `mcp_server.py` | MCP server for Claude Code: `service_status`, `service_logs`, `app_activity`, `start/stop/restart_service`, `run_task`, `task_input`, `stop_task`, `start_all/stop_all/restart_all`, and for the configuration `get_service_config`, `add_service`, `update_service`, `remove_service`. Stdlib only. |
 | `smctl.py` | The same from a shell: `python smctl.py status`, `logs NAME --since N -f`, `restart NAME --wait 5`, `run-task migrate --wait 10`, `input NAME TEXT`, `stop-all neo`, `config NAME`, `add NAME JSON`, `update NAME JSON [--rename NEW]`, `remove NAME`, … Add `--json` for the raw response. |
 
-Register the MCP server once for every project:
+**Settings → Claude Code** installs it for every project with one click, and can add a
+short section to `~/.claude/CLAUDE.md` telling Claude to use it rather than start servers
+itself (Remove takes both out again). The card also shows the commands to do it by hand:
 
 ```bash
-claude mcp add --scope user service-manager -- python D:\path\to\mcp_server.py
+# packaged app: the .exe is its own MCP server, no Python needed
+claude mcp add --scope user oncodes-service-manager -- "D:\OnCodes\Tools\OnCodes Dev Service Manager.exe" --mcp
+# from source
+claude mcp add --scope user oncodes-service-manager -- python D:\path\to\mcp_server.py
+# remove
+claude mcp remove oncodes-service-manager --scope user
 ```
 
-and tell Claude to use it (e.g. in `~/.claude/CLAUDE.md`) rather than running servers itself.
+The registration points at one copy of the app, so install again after moving the .exe.
+Restart open Claude Code sessions to pick up a change.
 
 Notes:
 

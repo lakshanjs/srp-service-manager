@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -13,6 +14,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 import config_manager
 import redis_lists      # tiny Redis/Memurai client for the Lists panel
 import update           # version string + the GitHub release check
+import claude_setup     # registering the MCP server with Claude Code
 from control_api import LogBuffer  # recent log lines, readable through the control API
 
 # Tk's canvas draws shapes with no antialiasing, which makes a small circle badge look
@@ -880,6 +882,7 @@ class UIManager:
         if (self.config_editor is not None
                 and self.config_editor.get('1.0', 'end-1c') == self.config_editor_baseline):
             self._load_config_editor()
+        self._refresh_claude_status()  # it may have been changed from a terminal meanwhile
         self.show_page(SETTINGS_PAGE)
 
     def _set_nav_bg(self, page_id, color):
@@ -2038,6 +2041,7 @@ class UIManager:
         self._build_settings_projects(container)
         self._build_settings_services(container)
         self._build_settings_config(container)
+        self._build_settings_claude(container)
         self._build_settings_updates(container)
         self._build_settings_about(container)
 
@@ -2593,6 +2597,136 @@ class UIManager:
         return None
 
     # ------------------------------------------------------- settings: about
+
+    def _build_settings_claude(self, container):
+        """Install or remove this app's MCP server in Claude Code, or show the commands."""
+        card = self._card(container, "Claude Code")
+        ttk.Label(card,
+                  text="Lets Claude Code check, start, restart and read the logs of the "
+                       "services here, instead of starting its own copies of the servers. "
+                       "Installs for all your projects.",
+                  style="Subtitle.TLabel", wraplength=self._px(640), justify='left').pack(
+                      anchor='w', pady=(0, self._px(12)))
+
+        state = ttk.Frame(card)
+        state.pack(fill='x')
+        self.claude_state = ttk.Label(state, text="", style="State.TLabel")
+        self.claude_state.pack(side='left')
+        self.claude_detail = ttk.Label(card, text="", style="Mono.TLabel", justify='left',
+                                       wraplength=self._px(640))
+        self.claude_detail.pack(anchor='w', pady=(self._px(4), self._px(10)))
+
+        self.claude_note_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(card, variable=self.claude_note_var,
+                        text="Also tell Claude to use it, in ~/.claude/CLAUDE.md").pack(anchor='w')
+        ttk.Label(card,
+                  text="A short section saying to use these tools and never start the servers "
+                       "from a shell. Without it, Claude often starts its own copy anyway. "
+                       "Remove takes it out again; the rest of the file is left alone.",
+                  style="Subtitle.TLabel", wraplength=self._px(620), justify='left').pack(
+                      anchor='w', padx=(self._px(28), 0), pady=(0, self._px(12)))
+
+        row = ttk.Frame(card)
+        row.pack(anchor='w')
+        self.claude_install_btn = ttk.Button(row, text="Install", style="Accent.TButton",
+                                             command=lambda: self._claude_action("install"))
+        self.claude_install_btn.pack(side='left', padx=(0, self._px(8)))
+        self.claude_remove_btn = ttk.Button(row, text="Remove",
+                                            command=lambda: self._claude_action("remove"))
+        self.claude_remove_btn.pack(side='left')
+        self.claude_result = ttk.Label(card, text="", style="Subtitle.TLabel",
+                                       wraplength=self._px(640), justify='left')
+        self.claude_result.pack(anchor='w', pady=(self._px(8), 0))
+
+        # The same thing by hand, for a machine where the button can't reach `claude`.
+        ttk.Label(card, text="To do it by hand, run in a terminal:", style="Section.TLabel").pack(
+            anchor='w', pady=(self._px(16), self._px(6)))
+        manual = ttk.Frame(card)
+        manual.pack(fill='x')
+        manual.columnconfigure(1, weight=1)
+        for i, (label, command) in enumerate(zip(("Install", "Remove"),
+                                                 claude_setup.manual_commands())):
+            ttk.Label(manual, text=label, style="Faint.TLabel").grid(
+                row=i, column=0, sticky='w', padx=(0, self._px(10)), pady=self._px(3))
+            entry = ttk.Entry(manual, font=(MONO_FONT, 9))
+            entry.insert(0, command)
+            entry.configure(state="readonly")
+            entry.grid(row=i, column=1, sticky='ew', pady=self._px(3))
+            ttk.Button(manual, text="Copy", style="Small.TButton",
+                       command=lambda c=command: self._copy_text(c)).grid(
+                           row=i, column=2, padx=(self._px(8), 0), pady=self._px(3))
+        ttk.Label(card,
+                  text="It runs this copy of the app, so install again if you move the .exe. "
+                       "Open Claude Code sessions pick up a change once they're restarted.",
+                  style="Subtitle.TLabel", wraplength=self._px(640), justify='left').pack(
+                      anchor='w', pady=(self._px(10), 0))
+        self._refresh_claude_status()
+
+    def _refresh_claude_status(self):
+        st = claude_setup.status()
+        if not st["cli"]:
+            label, color = "Claude Code not found", ATTENTION_COLOR
+            detail = "Install Claude Code, then install this from here or by hand."
+        elif st["current"]:
+            label, color = "Installed", RUNNING_COLOR
+            detail = "Runs " + subprocess.list2cmdline(st["command"])
+        elif st["installed"]:
+            label, color = "Installed for another copy of the app", ATTENTION_COLOR
+            entry = st["entry"]
+            detail = ("Runs " + subprocess.list2cmdline([entry.get("command", "")]
+                                                         + list(entry.get("args") or []))
+                      + ". Install again to point it at this one.")
+        elif st["legacy"]:
+            label, color = "Installed under an old name", ATTENTION_COLOR
+            detail = (f"Registered as '{st['legacy'][0]}'. Install replaces it with "
+                      f"'{claude_setup.SERVER_NAME}'.")
+        else:
+            label, color, detail = "Not installed", MUTED, ""
+        self.claude_state.configure(text=label, foreground=color)
+        self.claude_detail.configure(text=detail)
+        self.claude_install_btn.configure(
+            text="Install again" if st["installed"] else "Install",
+            state="normal" if st["cli"] else "disabled")
+        self.claude_remove_btn.configure(
+            state="normal" if st["cli"] and (st["installed"] or st["legacy"] or st["note"])
+            else "disabled")
+        self.claude_note_var.set(st["note"] or not st["installed"])
+
+    def _claude_action(self, action):
+        """Run `claude mcp add/remove` off the main thread; it takes a second or two."""
+        with_note = self.claude_note_var.get()
+        for button in (self.claude_install_btn, self.claude_remove_btn):
+            button.configure(state="disabled")
+        self.claude_result.configure(
+            text="Installing…" if action == "install" else "Removing…", foreground=MUTED)
+
+        def work():
+            try:
+                if action == "install":
+                    ok, message = claude_setup.install()
+                    if ok and with_note:
+                        claude_setup.add_note()
+                    elif ok and not with_note and claude_setup.has_note():
+                        claude_setup.remove_note()
+                else:
+                    ok, message = claude_setup.uninstall()
+                    if ok and claude_setup.has_note():
+                        claude_setup.remove_note()
+            except Exception as e:  # a hung CLI, an unwritable CLAUDE.md, ...
+                ok, message = False, f"{type(e).__name__}: {e}"
+            self.root.after(0, done, ok, message)
+
+        def done(ok, message):
+            self.claude_result.configure(text=message, foreground=MUTED if ok else FAULT_COLOR)
+            self.home_log(f"Claude Code: {message}")
+            self._refresh_claude_status()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _copy_text(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.claude_result.configure(text="Copied to the clipboard.", foreground=MUTED)
 
     def _build_settings_updates(self, container):
         """Where releases come from. Public repo, so the token is optional."""
